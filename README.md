@@ -2,7 +2,7 @@
 
 A股港股量化工作台 —— DeepSeek Harness 插件。
 
-**当前版本 `0.7.0`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
+**当前版本 `0.7.1`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
 
 在侧边栏底部提供独立的「A股港股」整页：**A 股与港股**的自选股管理、K线图、公司财务数据、策略配置与回测。
 
@@ -214,6 +214,24 @@ return { buy, sell, why }
 - 日期不合法（不是 `YYYY-MM-DD`、或不是真实存在的日期）的条目**直接丢掉**——宁可少一条，也不让编的日期进来；
 - 公告日未知时按「事先已知」处理，界面会明确写出来：**那是个建模假设，不是事实**。
 
+#### 两条检索路径（宿主挂了就用宿主的，坏了用内置的）
+
+宿主 `web` 服务的搜索 provider **可能是坏的**——实测本机部署每次调用都报
+`WEB_PROVIDER_ERROR: DeepSeek returned no web_search_tool_result blocks`。所以检索是两级的：
+
+| 顺序 | 来源 | 覆盖范围 |
+| --- | --- | --- |
+| 1 | 宿主 `web.search`（部署配置的搜索提供方） | 通用网页 |
+| 2 | **内置财经资讯检索** | 东方财富站内搜索：财经新闻 + 公告 |
+
+宿主第一次失败后，本轮不再重试它，直接走内置检索；两条路都不通时如实报错，并且
+**不再继续给模型工具**（省掉后面几轮空转）。界面上会写明这次用的是哪条路、宿主报了什么错、
+以及去**设置 → 插件 → 插件配置 → Web search** 改 Endpoint 就能修好宿主搜索。
+
+内置检索的结果会标注来源（`内置财经资讯检索·东方财富站内搜索：媒体新闻与公告`），
+不冒充通用搜索。对选股策略来说这部分内容恰好最相关——会议、业绩、发布会都在公告与新闻里。
+抓网页（`web_fetch`）同样先走宿主服务，不可用时退回插件直连取正文。
+
 宿主没挂 `web` 服务时不会假装查过：返回值里写明「未挂载 web 服务，本次没有联网查证」，
 界面照原样显示。`/astock/api/health` 里的 `webSearch` 字段就是这项能力的状态。
 
@@ -400,8 +418,8 @@ tests/
 ```bash
 pnpm test                 # 三套全跑
 node tests/engine.test.mjs   # 策略与回测引擎（纯离线，43 项）
-node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + 事件路由 + 港股事件解析 + 联网查证工具循环 + 多轮对话与表达式输出（208 项）
-node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链 + AI 对话与表达式模式（237 项）
+node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + 事件路由 + 港股事件解析 + 联网查证工具循环 + 多轮对话与表达式输出 + 检索兜底（218 项）
+node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链 + AI 对话与表达式模式 + 检索来源提示（240 项）
 ```
 
 `host.test.mjs` 与 `client.test.mjs` 需要网络（要打腾讯/东财的真实接口）。`engine.test.mjs` 完全离线，只读 `tests/fixtures/`。
@@ -439,6 +457,29 @@ curl -s --max-time 5 http://127.0.0.1:3080/plugins/events \
 
 每个版本对应一次 GitHub 提交与一次 npm 发布。完整提交历史见
 [commits](https://github.com/hzy1522/dsh-astock/commits/main)。
+
+### 0.7.1
+
+**修「AI 的 web_search 用不了」：检索加了一层内置兜底**
+
+用运行时探针在真实 Host 进程里查过，结论很明确：
+
+- `llm` 的工具调用**完全正常**——模型会正确发出 `web_search` 的流式工具调用；
+- 坏的是宿主 `web.search`：每次调用都返回
+  `WEB_PROVIDER_ERROR: DeepSeek returned no web_search_tool_result blocks`，
+  它配的搜索 Endpoint（`open.feedcoopapi.com/search_api/global_search/messages`）没返回原生搜索结果。
+
+插件这边能做的是**不把整件事卡在宿主的配置上**：
+
+- 宿主搜索失败后自动改用**内置财经资讯检索**（东方财富站内搜索，覆盖财经新闻与公告），
+  实测能搜到「贵州茅台召开半年度业绩说明会」这类带日期的新闻，正是策略需要的东西；
+- 宿主 provider 失败一次后本轮不再重试；两条路都不通就如实报错并停止再给工具；
+- 界面写明这次用的是哪条路、宿主的原始报错，以及修好宿主搜索的路径
+  （设置 → 插件 → 插件配置 → Web search → Endpoint）；
+- `web_fetch` 同样加了插件直连的兜底。
+
+测试：host 208 → 218 项（内置检索结构、宿主可用时走宿主、provider 报错时退回内置、
+本轮不再重试、两条路都不通），client 237 → 240 项（检索来源与修复路径提示）。合计 501 项全通过。
 
 ### 0.7.0
 

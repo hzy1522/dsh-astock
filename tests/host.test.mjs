@@ -401,17 +401,22 @@ console.log('\n[9b] 联网查证（多轮工具调用）')
   check('日期不合法的候选事件被丢弃', suggested.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date)))
   check('多轮用量被累加', res.body.usage.inputTokens === 1100 && res.body.usage.outputTokens === 150, JSON.stringify(res.body.usage))
 
-  // 搜索失败：工具报错要交回模型，而不是让整个生成失败。
+  // 宿主搜索失败：要退回内置财经资讯检索，而不是让联网查证整个废掉。
   llmCalls.length = 0
   searchThrows = '搜索服务不可用'
   llmRounds = [round1, round2]
-  const failed = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略', code: '600519' } })
+  const fellBack = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略', code: '600519' } })
   llmRounds = null
   searchThrows = null
-  check('搜索失败时不中断生成', failed.status === 200 && typeof failed.body.code === 'string', JSON.stringify(failed.body).slice(0, 120))
-  check('搜索失败会如实回报', typeof failed.body.searchError === 'string' && failed.body.searchError.includes('搜索服务不可用'), failed.body.searchError)
-  check('失败的工具结果标了 isError',
-    llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && c.isError === true)))
+  check('搜索失败时不中断生成', fellBack.status === 200 && typeof fellBack.body.code === 'string', JSON.stringify(fellBack.body).slice(0, 120))
+  check('退回内置检索并标记来源', fellBack.body.builtinSearch === true && fellBack.body.searchSource === 'builtin',
+    JSON.stringify({ source: fellBack.body.searchSource, builtin: fellBack.body.builtinSearch }))
+  check('宿主搜索的报错照样回报给用户', String(fellBack.body.searchError).includes('搜索服务不可用'),
+    String(fellBack.body.searchError).slice(0, 60))
+  check('工具结果不算失败（内置检索成功了）',
+    llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && c.isError === false)))
+  check('工具结果里带上了内置检索的标注',
+    llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && String(c.content[0].text).includes('内置财经资讯检索'))))
 
   // 没有事件数据的股票：必须**明确告诉模型**别用事件因子，否则生成的策略一跑就报错。
   llmCalls.length = 0
@@ -563,6 +568,37 @@ console.log('\n[9d] 多轮对话 + 表达式模式')
     body: { description: '发布会前后', mode: 'expr', code: '600519', history: [] },
   })
   check('表达式里的负数事件参数原样保留', withEvent.body.expr.sell === 'EVCUS(-1)', withEvent.body.expr.sell)
+}
+
+console.log('\n[9b2] 内置财经资讯检索（宿主搜索不可用时的兜底）')
+{
+  const { eastmoneySearch, searchWithFallback } = host.__test
+
+  // 直连东财站内搜索：媒体新闻 + 公告，返回可读文本（含日期与来源链接）
+  const hits = await eastmoneySearch('贵州茅台 业绩说明会', 4)
+  check('内置检索有结果', typeof hits === 'string' && hits.includes('贵州茅台'), hits.slice(0, 60))
+  check('结果是「标题 / 媒体+日期 / 链接」结构',
+    /\n  \S+\s+\d{4}-\d{2}-\d{2}\n  https?:\/\//.test(hits), hits.slice(0, 160))
+  check('去掉了高亮标签', !hits.includes('<em>'))
+
+  // 宿主 provider 正常时用它，不用兜底
+  const okState = { webOk: true, webError: '', hardFail: false }
+  const okHost = await searchWithFallback({ search: async () => ({ content: '宿主搜索的结果', sources: [] }) }, '测试', okState)
+  check('宿主可用时用宿主搜索', okHost.source === 'host' && okHost.text.includes('宿主搜索的结果'), okHost.source)
+
+  // 宿主 provider 报错时退回内置检索，并记住「本轮别再试它了」
+  const brokenState = { webOk: true, webError: '', hardFail: false }
+  const brokenHost = { search: async () => { const e = new Error('DeepSeek returned no web_search_tool_result blocks'); e.code = 'WEB_PROVIDER_ERROR'; throw e } }
+  const fell = await searchWithFallback(brokenHost, '贵州茅台 业绩说明会', brokenState)
+  check('宿主 provider 报错时退回内置检索', fell.source === 'builtin' && fell.text.includes('内置财经资讯检索'), fell.source)
+  check('退回后本轮不再重试宿主 provider', brokenState.webOk === false && brokenState.webError.includes('no web_search_tool_result'))
+  const second = await searchWithFallback(brokenHost, '再搜一次', brokenState)
+  check('第二次直接走内置检索', second.source === 'builtin', second.source)
+
+  // 两条路都不通：要如实说明
+  const deadState = { webOk: true, webError: '', hardFail: false }
+  const dead = await searchWithFallback({ search: async () => { throw new Error('provider down') } }, '', deadState)
+  check('内置检索没有结果时也算失败', dead.source === 'builtin' || dead.source === 'none', dead.source)
 }
 
 console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效）')

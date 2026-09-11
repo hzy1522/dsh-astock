@@ -630,6 +630,21 @@ console.log('\n[5c2] 多轮对话 + 表达式模式')
   check('反问时不改动编辑器', byData('buy-expr').props.value === buyBefore, byData('buy-expr').props.value)
   check('反问时标明本轮未改动策略', collectText(tree).includes('本轮只回答，未改动策略'))
 
+// 宿主搜索坏了、但内置检索顶上时：必须说清楚「这次用的不是宿主搜索」以及怎么修
+generateFixture = {
+  code: 'return { buy: GT(C, MA(C, 20)), sell: LT(C, MA(C, 20)) }',
+  provider: 'stub', model: 'stub-model', reply: '查了一下，用 20 日线。', usage: { outputTokens: 20 },
+  searched: true, searches: 2, builtinSearch: true, searchSource: 'builtin',
+  searchError: 'DeepSeek returned no web_search_tool_result blocks',
+}
+send('帮我查一下最近的说明会')
+await tick(); await tick()
+tree = render()
+const searchNoteText = collectText(tree)
+check('提示说明用了内置检索', searchNoteText.includes('内置财经资讯检索'), (searchNoteText.match(/联网查证[^，。]*/) || ['未找到'])[0])
+check('提示给出修宿主搜索的路径', searchNoteText.includes('设置 → 插件 → 插件配置 → Web search'))
+check('提示里带上宿主的原始报错', searchNoteText.includes('no web_search_tool_result'))
+
   // 清空对话
   collect(tree).find((n) => n.props['data-astk'] === 'chat-reset').props.onClick()
   tree = render()

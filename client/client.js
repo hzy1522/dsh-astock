@@ -1382,7 +1382,7 @@ window.__ModuleLoader__.load({
         // AI 联网查到的候选事件：要用户点一下确认，才会变成自定义事件参与回测。
         suggestedEvents: [], eventsBusy: false,
         // 多轮对话：{ role, text（发给模型的历史）, show（气泡里显示）, meta（做了什么） }
-        chat: [], chatBusy: false, exprPrev: null,
+        chat: [], chatBusy: false, exprPrev: null, searchNote: '',
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1651,11 +1651,25 @@ window.__ModuleLoader__.load({
           if (res.usage && typeof res.usage.outputTokens === 'number') note += '（输出 ' + res.usage.outputTokens + ' tokens）'
           if (res.events > 0) note += '，已把该股 ' + res.events + ' 条真实事件日期交给模型'
           else if (s.selected) note += '，该股没有可用的事件数据（已明确告诉模型不要用事件因子）'
-          if (res.searched) note += '，联网查证 ' + String(res.searches || 0) + ' 次'
-          else if (res.searchError) note += '，未能联网查证（' + String(res.searchError) + '）'
+          let searchNote = ''
+          if (res.searched) {
+            note += '，联网查证 ' + String(res.searches || 0) + ' 次'
+            if (res.builtinSearch) note += '（内置财经资讯检索）'
+          } else if (res.searchError) {
+            note += '，未能联网查证（' + String(res.searchError).slice(0, 60) + '）'
+          }
+          // 宿主搜索坏了就直说，并给出修的地方——这是部署侧配置问题，不是插件的锅，
+          // 但用户只会看到「搜不了」，所以必须把出路写清楚。
+          if (res.searchError && res.builtinSearch) {
+            searchNote = '宿主联网搜索不可用：' + String(res.searchError).slice(0, 200)
+              + '　本次已改用**内置财经资讯检索**（东方财富站内搜索，只覆盖财经新闻与公告）。'
+              + '要修好宿主搜索：设置 → 插件 → 插件配置 → Web search 里改 Endpoint。'
+          } else if (res.searchError) {
+            searchNote = '联网查证失败：' + String(res.searchError).slice(0, 240)
+          }
           if (suggested.length > 0) note += '，查出 ' + suggested.length + ' 个候选日期待你确认'
 
-          const patch = { aiNote: note, aiError: '', suggestedEvents: suggested, chatBusy: false, aiBusy: false }
+          const patch = { aiNote: note, aiError: '', suggestedEvents: suggested, chatBusy: false, aiBusy: false, searchNote }
           let applied = ''
           let historyText = reply
           if (produced === 'expr') {
@@ -2493,6 +2507,7 @@ window.__ModuleLoader__.load({
                   ? '当前是 JS 模式：会让模型输出 JS。'
                   : '当前是表达式模式：会让模型输出表达式；需求必须用循环/状态时它会改用 JS 并说明原因。')),
             s.aiNote ? React.createElement('div', { className: 'astk-note' }, '✓ ' + s.aiNote) : null,
+            s.searchNote ? React.createElement('div', { className: 'astk-warn', 'data-astk': 'search-note' }, s.searchNote) : null,
             s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null,
             // AI 联网查到的日期：必须由用户点一下确认，才会变成可回测的自定义事件。
             s.suggestedEvents.length > 0
