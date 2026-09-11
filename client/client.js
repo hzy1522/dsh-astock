@@ -93,6 +93,10 @@ window.__ModuleLoader__.load({
       '.astk-evk{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11.5px;white-space:nowrap;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}',
       '.astk-evk-meeting{color:var(--dsw-alias-brand-primary)}',
       '.astk-evk-exdiv{color:var(--dsw-alias-label-primary)}',
+      '.astk-evk-custom{color:var(--dsw-alias-label-secondary);border:1px dashed var(--dsw-alias-border-l2)}',
+      '.astk-unverified{color:var(--dsw-alias-label-secondary);font-size:11.5px;margin-left:6px}',
+      '.astk-unverified a{color:inherit;text-decoration:underline}',
+      '.astk-btn-mini{padding:1px 6px;font-size:11.5px}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -390,11 +394,10 @@ window.__ModuleLoader__.load({
           else if (callName === 'MAX') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.max(v, A[1][i])))
           else if (callName === 'MIN') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.min(v, A[1][i])))
           // ---- 事件因子：真实事件日期 + 交易日换算，全部来自公开数据 ----
-          else if (callName === 'EV' || callName === 'EVMEET' || callName === 'EVREP' || callName === 'EVDIV') {
-            if (!S.EV) throw new Error('事件因子需要公司事件数据（说明会 / 财报预约披露 / 除权除息），这只股票没取到，可到「公司数据」页确认')
+          else if (EV_FNS.indexOf(callName) >= 0) {
+            if (!S.EV) throw new Error('事件因子需要公司事件数据（说明会 / 财报预约披露 / 除权除息 / 自定义事件），这只股票没取到，可到「公司数据」页确认')
             if (node.args.length === 0) throw new Error(callName + ' 需要一个交易日偏移参数，例如 ' + callName + '(-1)')
-            const kind = callName === 'EV' ? 'all' : callName === 'EVMEET' ? 'meeting' : callName === 'EVREP' ? 'report' : 'exdiv'
-            out = eventFactor(S, callName, kind, constArg(A[0], callName))
+            out = eventFactor(S, callName, EV_KIND[callName], constArg(A[0], callName))
           }
           // ---- 市场情绪因子：全部由「个股 + 大盘指数」两组序列算出，完全可回测 ----
           else if (callName === 'RS' || callName === 'IDXRET' || callName === 'IDXMA' || callName === 'IDXVOL' || callName === 'IDXDEV' || callName === 'BETA') {
@@ -457,7 +460,7 @@ window.__ModuleLoader__.load({
     function buildEventIndex(bars, events) {
       if (!Array.isArray(events) || events.length === 0 || !Array.isArray(bars) || bars.length === 0) return null
       const iso = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v === null || v === undefined ? '' : v)) ? String(v) : null)
-      const byKind = { all: [], meeting: [], report: [], exdiv: [] }
+      const byKind = { all: [], meeting: [], report: [], exdiv: [], custom: [] }
       for (const ev of events) {
         const date = iso(ev && ev.date)
         if (date === null) continue
@@ -621,6 +624,10 @@ window.__ModuleLoader__.load({
       out.push(node)
       return out
     }
+
+    /** 事件因子函数名 → 事件类型。交易日换算与「不许提前知道」的保护都在 eventFactor 里。 */
+    const EV_FNS = ['EV', 'EVMEET', 'EVREP', 'EVDIV', 'EVCUS']
+    const EV_KIND = { EV: 'all', EVMEET: 'meeting', EVREP: 'report', EVDIV: 'exdiv', EVCUS: 'custom' }
 
     /** 数值显示：太小或太大的数都给两三位有效精度，null 显示破折号。 */
     const num = (v) => {
@@ -900,6 +907,7 @@ window.__ModuleLoader__.load({
         EVMEET: marketFn('EVMEET'),
         EVREP: marketFn('EVREP'),
         EVDIV: marketFn('EVDIV'),
+        EVCUS: marketFn('EVCUS'),
       }
     }
 
@@ -909,7 +917,7 @@ window.__ModuleLoader__.load({
       'BOLL_UP', 'BOLL_MID', 'BOLL_LOW', 'CROSS', 'GT', 'LT', 'GTE', 'LTE', 'AND', 'OR', 'NOT',
       'ABS', 'MAX', 'MIN',
       'RS', 'IDXRET', 'IDXMA', 'IDXDEV', 'IDXVOL', 'BETA',
-      'EV', 'EVMEET', 'EVREP', 'EVDIV',
+      'EV', 'EVMEET', 'EVREP', 'EVDIV', 'EVCUS',
     ]
 
     /**
@@ -1327,6 +1335,8 @@ window.__ModuleLoader__.load({
         quote: null, quoteError: '',
         fins: [], finsError: '', finsLoading: false,
         events: [], eventsError: '', eventsLoading: false, eventCounts: null,
+        // AI 联网查到的候选事件：要用户点一下确认，才会变成自定义事件参与回测。
+        suggestedEvents: [], eventsBusy: false,
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1443,10 +1453,38 @@ window.__ModuleLoader__.load({
           })
       }
 
+      /**
+       * 覆盖式保存自定义事件，然后重新读一遍事件列表。
+       *
+       * 自定义事件是**用户确认过**的日期，与交易所事件分开管理，所以这里整体提交。
+       * @param code - 股票代码。
+       * @param items - 完整的新列表（空数组即清空）。
+       * @param note - 传 'accepted' 表示这批来自 AI 候选，成功后清掉候选区。
+       */
+      function saveCustomEvents(code, items, note) {
+        store.set({ eventsBusy: true })
+        apiPost('custom-events', { code, items })
+          .then((res) => {
+            const patch = {
+              events: Array.isArray(res.events) ? res.events : [],
+              eventCounts: res.counts || null, eventsBusy: false,
+            }
+            if (note === 'accepted') {
+              patch.suggestedEvents = []
+              // 反馈写在 AI 面板上（按钮就在那里），而不是一个看不见的 note 字段。
+              const done = '已把 ' + items.length + ' 个日期加入该股自定义事件（标记为未核实），策略里用 EVCUS(n) 引用'
+              const previous = String(store.get().aiNote || '')
+              patch.aiNote = previous === '' ? done : previous + '　·　' + done
+            }
+            store.set(patch)
+          })
+          .catch((error) => store.set({ eventsBusy: false, eventsError: String((error && error.message) || error) }))
+      }
+
       function select(code) {
         store.set({
           selected: code, quote: null, quoteError: '', fins: [], finsError: '',
-          events: [], eventsError: '', eventCounts: null, hover: null, offset: 0, bt: null,
+          events: [], eventsError: '', eventCounts: null, suggestedEvents: [], hover: null, offset: 0, bt: null,
         })
         loadQuote(code); loadFins(code); loadEvents(code); loadBars()
       }
@@ -1540,6 +1578,11 @@ window.__ModuleLoader__.load({
           if (res.usage && typeof res.usage.outputTokens === 'number') note += '（输出 ' + res.usage.outputTokens + ' tokens）'
           if (res.events > 0) note += '，已把该股 ' + res.events + ' 条真实事件日期交给模型'
           else if (s.selected) note += '，但没取到该股的事件日期（需要事件因子的策略可能不准）'
+          // 联网查证：搜了几次、有没有查不到、有没有降级，都要如实说。
+          if (res.searched) note += '，联网查证 ' + String(res.searches || 0) + ' 次'
+          else if (res.searchError) note += '，未能联网查证（' + String(res.searchError) + '）'
+          const suggested = Array.isArray(res.suggestedEvents) ? res.suggestedEvents : []
+          if (suggested.length > 0) note += '，查出 ' + suggested.length + ' 个候选日期待你确认'
           try {
             const bars = store.get().bars
             if (bars && bars.length >= 30) {
@@ -1549,7 +1592,11 @@ window.__ModuleLoader__.load({
           } catch (error) {
             note += '；但试运行报错：' + String((error && error.message) || error)
           }
-          store.set({ jsSource: code, jsSourcePrev: s.jsSource, strategyMode: 'js', aiBusy: false, aiNote: note, aiError: '' })
+          store.set({
+            jsSource: code, jsSourcePrev: s.jsSource, strategyMode: 'js',
+            aiBusy: false, aiNote: note, aiError: '',
+            suggestedEvents: suggested,
+          })
         } catch (error) {
           store.set({ aiBusy: false, aiNote: '', aiError: '生成失败：' + String((error && error.message) || error) })
         }
@@ -2010,13 +2057,38 @@ window.__ModuleLoader__.load({
             React.createElement('td', null, fmt(r.roe)),
             React.createElement('td', null, fmt(r.gross))))
           // 公司动态：真实事件日期。策略里的 EVMEET(-1) 这类事件因子，靠的就是这张表。
-          const eventKind = { meeting: '说明会', report: '财报披露', exdiv: '除权除息' }
-          const eventRows = s.events.map((ev, i) => React.createElement('tr', { key: 'ev' + i, 'data-astk': 'event-row' },
-            React.createElement('td', { 'data-astk': 'event-date' }, ev.date),
-            React.createElement('td', null, React.createElement('span', { className: 'astk-evk astk-evk-' + ev.kind }, eventKind[ev.kind] || ev.kind)),
-            React.createElement('td', null, ev.title),
-            React.createElement('td', null, ev.announcedAt ? ev.announcedAt + ' 公告' : '事先已公开'),
-            React.createElement('td', null, ev.actual && ev.actual !== ev.date ? '实际 ' + ev.actual : '')))
+          const eventKind = { meeting: '说明会', report: '财报披露', exdiv: '除权除息', custom: '自定义' }
+          const customEvents = s.events.filter((ev) => ev.kind === 'custom')
+          const eventRows = s.events.map((ev, i) => React.createElement('tr', {
+            key: 'ev' + i,
+            'data-astk': 'event-row',
+            className: ev.kind === 'custom' ? 'astk-evk-row-custom' : null,
+          },
+          React.createElement('td', { 'data-astk': 'event-date' }, ev.date),
+          React.createElement('td', null, React.createElement('span', { className: 'astk-evk astk-evk-' + ev.kind }, eventKind[ev.kind] || ev.kind)),
+          React.createElement('td', null,
+            ev.title,
+            // 未核实的日期必须一眼能看出来，并给出出处链接。
+            ev.verified === false
+              ? React.createElement('span', { className: 'astk-unverified' }, ev.url
+                  ? React.createElement('a', { href: ev.url, target: '_blank', rel: 'noreferrer' }, ' 未核实·来源')
+                  : ' 未核实')
+              : null),
+          React.createElement('td', null,
+            ev.kind === 'custom'
+              ? (ev.announcedAt ? ev.announcedAt + ' 公告' : '公告日未知（按事先已知处理）')
+              : (ev.announcedAt ? ev.announcedAt + ' 公告' : '事先已公开')),
+          React.createElement('td', null, ev.actual && ev.actual !== ev.date ? '实际 ' + ev.actual : ''),
+          React.createElement('td', null, ev.kind === 'custom'
+            ? React.createElement('button', {
+                className: 'astk-btn astk-btn-mini',
+                'data-astk': 'event-del',
+                disabled: s.eventsBusy,
+                onClick: () => saveCustomEvents(s.selected, customEvents
+                  .filter((x) => !(x.date === ev.date && x.title === ev.title))
+                  .map((x) => ({ date: x.date, title: x.title, announcedAt: x.announcedAt, source: x.url, addedBy: x.source.includes('手工') ? 'manual' : 'ai' }))),
+              }, '✕ 删除')
+            : null)))
           const eventsSection = React.createElement('div', { className: 'astk-sec' },
             React.createElement('h4', null, '公司动态（真实事件日期）'),
             s.eventsLoading ? React.createElement('div', { className: 'astk-note' }, '加载事件日期中…') : null,
@@ -2028,7 +2100,8 @@ window.__ModuleLoader__.load({
                     React.createElement('th', null, '类型'),
                     React.createElement('th', null, '内容'),
                     React.createElement('th', null, '何时公开'),
-                    React.createElement('th', null, '备注'))),
+                    React.createElement('th', null, '备注'),
+                    React.createElement('th', null, ''))),
                   React.createElement('tbody', null, eventRows))
               : (s.eventsLoading || s.eventsError ? null
                 : React.createElement('div', { className: 'astk-note' },
@@ -2039,7 +2112,11 @@ window.__ModuleLoader__.load({
               + 'n = -1 表示事件前一个交易日，n = 2 表示事件后第二个交易日；「哪天是交易日」由引擎按真实 K 线换算，不需要你算日历。'),
             React.createElement('div', { className: 'astk-note' },
               '「财报披露」用的是**预约披露日**而不是实际披露日：预约时间表是交易所期初公布的，用它做「财报前卖出」是合规的；'
-              + '用实际披露日等于提前知道了财报哪天出。除权除息日与会议日期同样都有公告日在前。'))
+              + '用实际披露日等于提前知道了财报哪天出。除权除息日与会议日期同样都有公告日在前。'),
+            React.createElement('div', { className: 'astk-warn' },
+              '「自定义」是你（或 AI 联网检索后经你确认）加进来的日期，标着**未核实**，交易所数据里没有它。'
+              + '公告日未知时按「事先已知」处理——如果那个日期在当时其实还没公开，用它做「提前埋伏」的回测就是不真实的。'
+              + '策略里引用自定义事件要用 EVCUS(n)，它不会混进 EV / EVMEET 的结果里。'))
           content = React.createElement('div', null,
             s.finsLoading ? React.createElement('div', { className: 'astk-note' }, '加载财务数据中…') : null,
             s.finsError ? React.createElement('div', { className: 'astk-err' }, '财务数据加载失败：' + s.finsError) : null,
@@ -2131,7 +2208,7 @@ window.__ModuleLoader__.load({
                 React.createElement('div', { className: 'astk-note' },
                   '可用（都是与 K 线等长的数组，索引可直接用）：C O H L V；MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)；RSI(n) DIF() DEA() MACD() BOLL_UP(p,k) BOLL_MID(p) BOLL_LOW(p,k)；CROSS(a,b) GT LT GTE LTE AND OR NOT；ABS/MAX/MIN。'
                 + ' 市场情绪因子（依赖沪深300，可回测）：BENCH 指数序列、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'
-                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息；'
+                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息、EVCUS(n) 自定义事件（AI 检索/手工添加，未核实）；'
                 + 'n 是相对该事件的第 n 个交易日（-1 = 前一交易日，2 = 后第二个交易日），交易日换算按真实 K 线，不用你自己算日期。'),
                 React.createElement('div', { className: 'astk-note' },
                   '必须 return { buy, sell }，两个数组长度都要等于 C.length。可以写任意 JS：循环、变量、多条件分支、自定义中间量。'),
@@ -2158,7 +2235,7 @@ window.__ModuleLoader__.load({
                 React.createElement('div', { className: 'astk-note' },
                   '可用：C O H L V（收/开/高/低/量）、MA(n) EMA(n) SUM(n) STD(n)、RSI(n)、DIF() DEA() MACD()、BOLL_UP(n,k) BOLL_MID(n) BOLL_LOW(n,k)、HHV(n) LLV(n) REF(x,n) CROSS(a,b)、ABS/MAX/MIN，以及 + - * / > < >= <= == != AND OR NOT 与括号。'
                 + ' 市场情绪因子（依赖沪深300，可回测）：BENCH（指数序列）、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'
-                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息；'
+                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息、EVCUS(n) 自定义事件（AI 检索/手工添加，未核实）；'
                 + 'n 是相对该事件的第 n 个交易日（-1 = 前一交易日，2 = 后第二个交易日）。'),
                 React.createElement('div', { className: 'astk-note' },
                   '说明：信号在收盘产生、次日开盘成交（无未来函数）；买入当日不可卖出（T+1）。需要循环或多分支时切到 JavaScript 模式。'))
@@ -2219,6 +2296,35 @@ window.__ModuleLoader__.load({
                   : '生成后会切到 JavaScript 模式并填入代码。')),
             s.aiNote ? React.createElement('div', { className: 'astk-note' }, '✓ ' + s.aiNote) : null,
             s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null,
+            // AI 联网查到的日期：必须由用户点一下确认，才会变成可回测的自定义事件。
+            s.suggestedEvents.length > 0
+              ? React.createElement('div', { className: 'astk-sec', 'data-astk': 'suggested-events' },
+                  React.createElement('h4', null, 'AI 查到的候选事件（需要你确认）'),
+                  React.createElement('div', { className: 'astk-note' },
+                    '这些日期是模型联网查到的，**没有经过交易所数据核对**。确认后它们会成为「自定义事件」，在「公司数据」页标为未核实，策略里用 EVCUS(n) 引用。'),
+                  s.suggestedEvents.map((ev, i) => React.createElement('div', { key: 'sg' + i, className: 'astk-cond' },
+                    React.createElement('span', { className: 'astk-cond-t' }, ev.date + '　' + ev.title),
+                    React.createElement('span', { className: 'astk-cond-v' },
+                      (ev.announcedAt ? ev.announcedAt + ' 公布　' : '')
+                      + (ev.evidence || '')
+                      + (ev.source ? '　' + ev.source : '')))),
+                  React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
+                    React.createElement('button', {
+                      className: 'astk-btn astk-btn-on',
+                      'data-astk': 'accept-suggested',
+                      disabled: s.eventsBusy,
+                      onClick: () => {
+                        const existing = store.get().events.filter((e) => e.kind === 'custom')
+                          .map((e) => ({ date: e.date, title: e.title, announcedAt: e.announcedAt, source: e.url, addedBy: 'ai' }))
+                        saveCustomEvents(store.get().selected, existing.concat(s.suggestedEvents), 'accepted')
+                      },
+                    }, s.eventsBusy ? '保存中…' : '确认加入（' + s.suggestedEvents.length + ' 条）'),
+                    React.createElement('button', {
+                      className: 'astk-btn',
+                      'data-astk': 'dismiss-suggested',
+                      onClick: () => store.set({ suggestedEvents: [] }),
+                    }, '不要这些日期')))
+              : null,
             s.jsSourcePrev
               ? React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
                   React.createElement('button', {

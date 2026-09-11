@@ -109,9 +109,13 @@ const EVENTS = {
     { date: betweenDate(dayAt(I_B - 1), dayAt(I_B)), kind: 'meeting', title: '三季度业绩说明会（非交易日）', announcedAt: dayAt(I_B - 10), actual: null, source: 'stub' },
     { date: dayAt(I_C), kind: 'meeting', title: '当天才公告的说明会', announcedAt: dayAt(I_C), actual: null, source: 'stub' },
     { date: dayAt(BAR_N - 200), kind: 'exdiv', title: '除权除息日', announcedAt: dayAt(BAR_N - 210), actual: null, source: 'stub' },
+    // 自定义事件：只由 EVCUS 引用，绝不能混进 EVMEET 的结果里。
+    { date: dayAt(BAR_N - 140), kind: 'custom', title: 'AI 查到的产品发布会', announcedAt: dayAt(BAR_N - 150), actual: null, source: 'AI 联网检索（未核实）', url: 'https://example.com/launch', verified: false },
   ],
-  counts: { meeting: 3, report: 0, exdiv: 1 },
+  counts: { meeting: 3, report: 0, exdiv: 1, custom: 1 },
 }
+// 客户端 POST 上来的自定义事件：存起来，好让后面的读取能看到。
+let customEvents = []
 let eventsAvailable = true
 // 让测试可以模拟「指数取不到」的情况
 let indexAvailable = true
@@ -154,13 +158,34 @@ globalThis.fetch = async (url, init) => {
     }
     return { ok: true, status: 200, json: async () => makeDisclaimer(disclaimerAccepted) }
   }
+  if (key === 'custom-events') {
+    const payload = JSON.parse(String((init && init.body) || '{}'))
+    customEvents = Array.isArray(payload.items) ? payload.items : []
+    const custom = customEvents.map((it) => ({
+      date: it.date, kind: 'custom', title: it.title, announcedAt: it.announcedAt || null, actual: null,
+      source: it.addedBy === 'manual' ? '手工添加（未核实）' : 'AI 联网检索（未核实）',
+      url: it.source || '', verified: false,
+    }))
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        code: payload.code, market: 'cn',
+        events: EVENTS.events.concat(custom),
+        counts: { meeting: 3, report: 0, exdiv: 1, custom: custom.length },
+      }),
+    }
+  }
   if (key === 'events') {
     if (!eventsAvailable) return { ok: false, status: 500, json: async () => ({ error: '事件取数失败' }) }
     const code = new URLSearchParams(search || '').get('code')
     if (code !== '600519') {
-      return { ok: true, status: 200, json: async () => ({ code, market: 'hk', events: [], counts: { meeting: 0, report: 0, exdiv: 0 } }) }
+      return { ok: true, status: 200, json: async () => ({ code, market: 'hk', events: [], counts: { meeting: 0, report: 0, exdiv: 0, custom: 0 } }) }
     }
-    return { ok: true, status: 200, json: async () => EVENTS }
+    const custom = customEvents.map((it) => ({
+      date: it.date, kind: 'custom', title: it.title, announcedAt: it.announcedAt || null, actual: null,
+      source: 'AI 联网检索（未核实）', url: it.source || '', verified: false,
+    }))
+    return { ok: true, status: 200, json: async () => ({ ...EVENTS, events: EVENTS.events.concat(custom) }) }
   }
   if (key === 'quote') {
     const code = new URLSearchParams(search || '').get('code')
@@ -446,6 +471,41 @@ await tick(); await tick(); await tick()
 tree = render()
 check('生成结果有问题时提示试运行报错', collectText(tree).includes('试运行报错'), (collectText(tree).match(/试运行报错：\S+/) || [''])[0])
 check('有问题的代码仍填入编辑器', jsEditorValue() === 'const a = ')
+
+// 联网查到的候选事件：必须由用户确认后才成为自定义事件
+customEvents = []
+generateFixture = {
+  code: 'const sell = EVCUS(-1)\nconst buy = EVCUS(2)\nreturn { buy, sell }',
+  provider: 'stub', model: 'stub-model', usage: { outputTokens: 60 },
+  events: 27, searched: true, searches: 3, searchError: '',
+  suggestedEvents: [
+    { date: '2026-09-09', title: '秋季新品发布会', announcedAt: '2026-08-01', source: 'https://example.com/launch', evidence: '原文：定于 9 月 9 日' },
+    { date: '2026-09-20', title: '投资者交流会', announcedAt: null, source: 'https://example.com/ir', evidence: '' },
+  ],
+}
+findButton(tree, 'AI 生成代码').props.onClick()
+tree = render()
+await tick(); await tick(); await tick()
+tree = render()
+const suggestText = collectText(tree)
+check('提示说明联网查了几次', suggestText.includes('联网查证 3 次'), (suggestText.match(/联网查证 \d+ 次/) || ['未找到'])[0])
+check('提示说明有候选日期待确认', suggestText.includes('2 个候选日期待你确认'))
+check('候选事件区块渲染出来', collect(tree).some((n) => n.props['data-astk'] === 'suggested-events'))
+check('候选事件带日期与出处', suggestText.includes('2026-09-09') && suggestText.includes('https://example.com/launch'))
+check('确认前不会写入自定义事件', customEvents.length === 0)
+const acceptBtn = collect(tree).find((n) => n.props['data-astk'] === 'accept-suggested')
+check('有确认按钮', acceptBtn !== undefined)
+acceptBtn.props.onClick()
+tree = render()
+await tick(); await tick(); await tick()
+tree = render()
+// 原有的自定义事件不能被覆盖掉，新确认的追加进去。
+check('确认后写入了自定义事件（原有的一条保留）', customEvents.length === 3, JSON.stringify(customEvents.map((x) => x.date)))
+check('写入时带上来源与公告日',
+  customEvents.some((x) => x.date === '2026-09-09' && x.source === 'https://example.com/launch' && x.announcedAt === '2026-08-01'),
+  JSON.stringify(customEvents.find((x) => x.date === '2026-09-09')))
+check('确认后候选区块收起', collect(tree).every((n) => n.props['data-astk'] !== 'suggested-events'))
+check('确认后给出反馈', collectText(tree).includes('已把 3 个日期加入该股自定义事件'))
 
 // 接口失败：显示可读错误
 generateError = '模型调用失败：配额不足'
@@ -936,6 +996,40 @@ check('非交易日的会议顺延到之后第一个交易日', evDetailB.includ
   '期望 ' + dayAt(I_B - 1) + ' / 全文 ' + (evDetailB.match(/信号日 [\d-]+/) || ['未找到'])[0])
 tRows()[0].props.onClick()
 tree = render()
+
+// 2b) 自定义事件：单独一类，只由 EVCUS 引用，界面上标成「未核实」
+click('公司数据')
+const customText = collectText(tree)
+check('自定义事件渲染在事件表里', customText.includes('AI 查到的产品发布会') && customText.includes('自定义'))
+check('自定义事件标为未核实', customText.includes('未核实'))
+check('自定义事件给出出处链接',
+  collect(tree).some((n) => n.type === 'a' && n.props.href === 'https://example.com/launch'))
+check('自定义事件提示了公告日未知的处理方式', customText.includes('公告日未知（按事先已知处理）'))
+check('自定义事件可以删除', collect(tree).some((n) => n.props['data-astk'] === 'event-del'))
+// EVMEET 只认会议事件：自定义事件混进来的话，上面的「只 2 笔」就会变成 4 笔。
+check('自定义事件没有混进 EVMEET', tradesOf(evRun) === '2', tradesOf(evRun) + ' 笔')
+
+click('策略配置')
+useJs([
+  '// 自定义事件（AI 检索经用户确认）用自己的因子，与交易所事件互不干扰',
+  'return {',
+  '  buy: EVCUS(-1),',
+  '  sell: EVCUS(2),',
+  '  why: () => "AI 查到的发布会前一天买入",',
+  '}',
+].join('\n'))
+const evcusRun = await runBacktestNow()
+check('自定义事件策略能跑通', !evcusRun.includes('错误'), (evcusRun.match(/JS 策略错误[^]{0,60}/) || [''])[0])
+check('自定义事件产生了交易', Number(tradesOf(evcusRun)) >= 1, tradesOf(evcusRun) + ' 笔')
+tRows()[0].props.onClick()
+tree = render()
+const evcusDetail = collectText(tree)
+check('自定义事件的买入信号落在事件前一交易日',
+  evcusDetail.includes('信号日 ' + dayAt(BAR_N - 141)),
+  (evcusDetail.match(/信号日 [\d-]+/) || ['未找到'])[0])
+check('明细写明命中的自定义事件',
+  evcusDetail.includes('命中 ' + dayAt(BAR_N - 140) + ' AI 查到的产品发布会'),
+  (evcusDetail.match(/命中[^，。]{0,40}/) || ['未找到命中说明'])[0])
 
 // 3) 取不到事件数据时必须说清楚，而不是静默算成「没有信号」
 eventsAvailable = false

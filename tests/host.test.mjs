@@ -22,20 +22,48 @@ const routes = new Map()
 // 捕获 generateStrategy 交给 llm 的请求，用于断言请求形状。
 const llmCalls = []
 let llmChunks = []
+// 多轮工具调用：数组的每一项是一轮的 chunk 列表。
+let llmRounds = null
 let llmThrows = null
+// web 服务：默认提供一个可替换的搜索桩，也可以整体摘掉（验证降级路径）。
+const searchCalls = []
+let searchResult = {
+  content: '贵州茅台 2026 年半年度业绩说明会将于 8 月 21 日召开。',
+  sources: [{
+    url: 'https://example.com/notice',
+    title: '贵州茅台关于召开2026年半年度业绩说明会的公告',
+    snippet: '会议召开时间：2026 年 8 月 21 日（星期五）15:00-16:00',
+    publishedAt: '2026-08-14',
+  }],
+  truncated: false,
+}
+let searchThrows = null
+const webStub = {
+  async search(request) {
+    searchCalls.push(request)
+    if (searchThrows !== null) throw new Error(searchThrows)
+    return searchResult
+  },
+  async fetch(request) {
+    return { url: request.url, statusCode: 200, body: { kind: 'html', content: '<html><body><p>会议时间：2026 年 8 月 21 日</p></body></html>' }, truncated: false }
+  },
+}
+let webAvailable = true
 const services = {
   llm: {
     stream(options) {
       llmCalls.push(options)
       if (llmThrows !== null) throw new Error(llmThrows)
-      return (async function* () { for (const c of llmChunks) yield c })()
+      // llmRounds 非空时按轮消费（多轮工具调用用）；否则整份 llmChunks 就是一轮。
+      const chunks = llmRounds === null ? llmChunks : (llmRounds.shift() || [])
+      return (async function* () { for (const c of chunks) yield c })()
     },
   },
   agentDefaultModel: { currentSelection: () => ({ provider: 'mock-provider', model: 'mock-model' }) },
 }
 const ctx = {
   effect: (callback) => { callback() },
-  get: (name) => services[name],
+  get: (name) => (name === 'web' && !webAvailable ? undefined : (name === 'web' ? webStub : services[name])),
   webServer: {
     register: (route) => {
       routes.set(route.path, route.handler)
@@ -77,13 +105,14 @@ console.log('[1] 插件契约')
 check('导出 name', host.name === 'astock', host.name)
 check('导出 inject 含 webServer', Array.isArray(host.inject) && host.inject.includes('webServer'), JSON.stringify(host.inject))
 check('导出 apply 函数', typeof host.apply === 'function')
-check('注册了 9 条路由', routes.size === 9, [...routes.keys()].join(', '))
+check('注册了 10 条路由', routes.size === 10, [...routes.keys()].join(', '))
 
 console.log('\n[2] health 路由')
 {
   const { status, body } = await call('/astock/api/health')
   check('HTTP 200', status === 200)
   check('ok=true', body.ok === true)
+  check('health 报告联网能力', body.webSearch === true, 'webSearch=' + String(body.webSearch))
   check('返回落盘路径', typeof body.watchlistPath === 'string' && body.watchlistPath.includes('astock'), body.watchlistPath)
 }
 
@@ -307,6 +336,132 @@ console.log('\n[9] AI 生成策略（mock llm）')
   const noLlm = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
   check('llm 服务缺失时给出明确提示', noLlm.status === 500 && String(noLlm.body.error).includes('llm'), noLlm.body.error)
   services.llm = savedLlm
+}
+
+console.log('\n[9b] 联网查证（多轮工具调用）')
+{
+  // 第一轮：模型要搜；第二轮：它带着搜索结果写出代码 + 候选事件。
+  const finalText = [
+    '```javascript',
+    'const sell = EVCUS(-1)',
+    'const buy = EVCUS(2)',
+    'return { buy, sell, why: (i, side) => side === "buy" ? "发布会后第二个交易日" : "发布会前一个交易日" }',
+    '```',
+    '```events',
+    JSON.stringify([
+      { date: '2026-09-09', title: '秋季新品发布会', announcedAt: '2026-08-01', source: 'https://example.com/launch', evidence: '原文：发布会定于 2026 年 9 月 9 日举行' },
+      { date: '不是日期', title: '伪造条目', source: 'https://example.com/bad' },
+    ]),
+    '```',
+  ].join('\n')
+  const round1 = [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'call-1', name: 'web_search', argumentsDelta: '{"queries":["贵州茅台 ' },
+    { type: 'tool-call-delta', index: 0, id: 'call-1', argumentsDelta: '产品发布会 时间","贵州茅台 公告"]}' },
+    { type: 'usage', usage: { inputTokens: 200, outputTokens: 30 } },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+  const round2 = [
+    { type: 'text-delta', index: 0, text: finalText },
+    { type: 'usage', usage: { inputTokens: 900, outputTokens: 120 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  llmCalls.length = 0
+  searchCalls.length = 0
+  llmRounds = [round1, round2]
+  const res = await call('/astock/api/generate-strategy', {
+    body: { description: '公司召开发布会的前一个交易日卖出，会后的第二个交易日买入', code: '600519' },
+  })
+  llmRounds = null
+  check('HTTP 200', res.status === 200, JSON.stringify(res.body).slice(0, 160))
+  check('跑了两轮模型调用', llmCalls.length === 2, llmCalls.length + ' 轮')
+  check('第一轮把工具交给模型', Array.isArray(llmCalls[0].tools) && llmCalls[0].tools.some((t) => t.name === 'web_search'),
+    JSON.stringify((llmCalls[0].tools || []).map((t) => t.name)))
+  check('分片的工具调用被拼成完整参数',
+    searchCalls.length === 2 && searchCalls[0].query.includes('产品发布会') && searchCalls[1].query.includes('公告'),
+    JSON.stringify(searchCalls.map((c) => c.query)))
+  check('第二轮带着工具结果回给模型',
+    llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-call' && c.name === 'web_search'))
+    && llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && String(c.content[0].text).includes('业绩说明会'))),
+    JSON.stringify(llmCalls[1].messages.map((m) => m.role)))
+  check('系统提示追加了联网查证要求', llmCalls[0].system.includes('web_search') && llmCalls[0].system.includes('evidence'))
+  check('返回了代码', typeof res.body.code === 'string' && res.body.code.includes('EVCUS(-1)'), res.body.code.split('\n')[0])
+  check('events 区块没有被当成策略代码', !res.body.code.includes('秋季新品发布会'), res.body.code.split('\n')[0])
+  check('回报联网查证情况', res.body.searched === true && res.body.searches === 2, JSON.stringify({ searched: res.body.searched, searches: res.body.searches }))
+  const suggested = res.body.suggestedEvents
+  check('解析出候选事件', Array.isArray(suggested) && suggested.length === 1, JSON.stringify(suggested))
+  check('候选事件带日期/标题/来源/证据',
+    suggested[0].date === '2026-09-09' && suggested[0].title === '秋季新品发布会'
+    && suggested[0].source === 'https://example.com/launch' && suggested[0].evidence.includes('9 月 9 日'),
+    JSON.stringify(suggested[0]))
+  // 日期不合法的那条必须被丢掉——宁可少一条，也不能让编的日期进来。
+  check('日期不合法的候选事件被丢弃', suggested.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date)))
+  check('多轮用量被累加', res.body.usage.inputTokens === 1100 && res.body.usage.outputTokens === 150, JSON.stringify(res.body.usage))
+
+  // 搜索失败：工具报错要交回模型，而不是让整个生成失败。
+  llmCalls.length = 0
+  searchThrows = '搜索服务不可用'
+  llmRounds = [round1, round2]
+  const failed = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略', code: '600519' } })
+  llmRounds = null
+  searchThrows = null
+  check('搜索失败时不中断生成', failed.status === 200 && typeof failed.body.code === 'string', JSON.stringify(failed.body).slice(0, 120))
+  check('搜索失败会如实回报', typeof failed.body.searchError === 'string' && failed.body.searchError.includes('搜索服务不可用'), failed.body.searchError)
+  check('失败的工具结果标了 isError',
+    llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && c.isError === true)))
+
+  // 宿主没挂 web：静默降级，但要说清楚「这次没联网」。
+  webAvailable = false
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: 'return { buy: GT(C, MA(C, 20)), sell: LT(C, MA(C, 20)) }' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const noWeb = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略', code: '600519' } })
+  webAvailable = true
+  check('没有 web 服务时不给工具', llmCalls[0].tools === undefined)
+  check('没有 web 服务时不追加联网要求', llmCalls[0].system.includes('【联网查证】') === false)
+  check('没有 web 服务时如实回报',
+    noWeb.body.searched === false && noWeb.body.searchError.includes('未挂载 web 服务'), noWeb.body.searchError)
+  check('没有 web 服务时仍能生成', typeof noWeb.body.code === 'string' && noWeb.body.code.includes('MA(C, 20)'))
+}
+
+console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效）')
+{
+  await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
+
+  const saved = await call('/astock/api/custom-events', {
+    body: {
+      code: '600519',
+      items: [
+        { date: '2026-09-09', title: '秋季新品发布会', announcedAt: '2026-08-01', source: 'https://example.com/launch', evidence: '原文写明 9 月 9 日' },
+        { date: '2026-09-09', title: '秋季新品发布会', source: 'https://example.com/dup' },
+        { date: '2026/09/10', title: '日期格式不对' },
+        { date: '2026-09-11', title: '手工加的', addedBy: 'manual' },
+      ],
+    },
+  })
+  check('HTTP 200', saved.status === 200, JSON.stringify(saved.body).slice(0, 120))
+  const custom = saved.body.events.filter((e) => e.kind === 'custom')
+  check('只留下合法且去重的条目', custom.length === 2, JSON.stringify(custom.map((e) => e.date + ' ' + e.title)))
+  check('自定义事件标记为未核实',
+    custom.every((e) => e.verified === false && e.source.includes('未核实')), JSON.stringify(custom.map((e) => e.source)))
+  check('AI 检索与手工添加区分来源',
+    custom.some((e) => e.source === 'AI 联网检索（未核实）') && custom.some((e) => e.source === '手工添加（未核实）'),
+    JSON.stringify(custom.map((e) => e.source)))
+  check('带上来源链接', custom.some((e) => e.url === 'https://example.com/launch'))
+  check('counts 里统计了自定义事件', saved.body.counts.custom === 2, JSON.stringify(saved.body.counts))
+
+  // 自定义事件必须能从 events 路由读到（列表有进程内缓存，写入时要失效）。
+  const reread = await call('/astock/api/events', { query: 'code=600519' })
+  check('自定义事件出现在事件列表里', reread.body.events.some((e) => e.kind === 'custom'))
+  check('交易所事件没有被替代', reread.body.events.some((e) => e.kind === 'meeting'))
+
+  const cleared = await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
+  check('清空后不再返回自定义事件', cleared.body.events.every((e) => e.kind !== 'custom'))
+
+  const bad = await call('/astock/api/custom-events', { body: { code: 'NOPE', items: [] } })
+  check('非法代码返回 500 + error', bad.status === 500 && typeof bad.body.error === 'string', bad.body.error)
 }
 
 console.log('\n[10] 港股')
