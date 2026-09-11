@@ -2,7 +2,7 @@
 
 A股港股量化工作台 —— DeepSeek Harness 插件。
 
-**当前版本 `0.6.1`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
+**当前版本 `0.6.2`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
 
 在侧边栏底部提供独立的「A股港股」整页：**A 股与港股**的自选股管理、K线图、公司财务数据、策略配置与回测。
 
@@ -379,7 +379,7 @@ tests/
 pnpm test                 # 三套全跑
 node tests/engine.test.mjs   # 策略与回测引擎（纯离线，43 项）
 node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + 事件路由 + 港股事件解析 + 联网查证工具循环 + AI 生成诊断（185 项）
-node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链与一键改写（204 项）
+node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链与一键改写（206 项）
 ```
 
 `host.test.mjs` 与 `client.test.mjs` 需要网络（要打腾讯/东财的真实接口）。`engine.test.mjs` 完全离线，只读 `tests/fixtures/`。
@@ -417,6 +417,18 @@ curl -s --max-time 5 http://127.0.0.1:3080/plugins/events \
 
 每个版本对应一次 GitHub 提交与一次 npm 发布。完整提交历史见
 [commits](https://github.com/hzy1522/dsh-astock/commits/main)。
+
+### 0.6.2
+
+**修「限流后要等 30 分钟才恢复」**
+
+事件列表有 30 分钟进程内缓存，但取数出错时也写了缓存——于是上游限流一次，
+「缺了会议事件」的结果就被锁住半小时，上游恢复了用户也看不到。改成**只有成功才进缓存**。
+
+同时「公司数据」页新增 **↻ 重新加载事件日期** 按钮，取数失败会直接显示原因，
+不用切股票来触发重取。
+
+测试：client 204 → 206 项。合计 434 项全通过。
 
 ### 0.6.1
 

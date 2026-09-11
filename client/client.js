@@ -2099,6 +2099,7 @@ window.__ModuleLoader__.load({
             React.createElement('h4', null, '公司动态（真实事件日期）'),
             s.eventsLoading ? React.createElement('div', { className: 'astk-note' }, '加载事件日期中…') : null,
             s.eventsError ? React.createElement('div', { className: 'astk-err' }, '事件日期加载失败：' + s.eventsError) : null,
+            s.eventsNote ? React.createElement('div', { className: 'astk-warn' }, s.eventsNote) : null,
             s.events.length > 0
               ? React.createElement('table', { className: 'astk-tab', 'data-astk': 'event-table' },
                   React.createElement('thead', null, React.createElement('tr', null,
@@ -2119,6 +2120,13 @@ window.__ModuleLoader__.load({
             React.createElement('div', { className: 'astk-note' },
               '「财报披露」用的是**预约披露日**而不是实际披露日：预约时间表是交易所期初公布的，用它做「财报前卖出」是合规的；'
               + '用实际披露日等于提前知道了财报哪天出。除权除息日与会议日期同样都有公告日在前。'),
+            React.createElement('div', { style: { marginTop: '8px' } },
+              React.createElement('button', {
+                className: 'astk-btn',
+                'data-astk': 'events-reload',
+                disabled: s.eventsLoading,
+                onClick: () => loadEvents(s.selected),
+              }, s.eventsLoading ? '加载中…' : '↻ 重新加载事件日期')),
             React.createElement('div', { className: 'astk-warn' },
               '「自定义」是你（或 AI 联网检索后经你确认）加进来的日期，标着**未核实**，交易所数据里没有它。'
               + '公告日未知时按「事先已知」处理——如果那个日期在当时其实还没公开，用它做「提前埋伏」的回测就是不真实的。'

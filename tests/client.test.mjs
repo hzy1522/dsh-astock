@@ -553,6 +553,15 @@ const hkEventText = collectText(tree)
 check('港股事件为空时说明原因', hkEventText.includes('港股事件来自港交所公告'), (hkEventText.match(/港股事件来自[^。]*/) || ['未找到原因'])[0])
 click('策略配置')
 check('没有事件数据时在 AI 面板预警', collect(tree).some((n) => n.props['data-astk'] === 'no-events-warn'))
+// 上游限流是一时的：得让用户能自己重试，而不是等 30 分钟缓存过期。
+click('公司数据')
+const reloadBtn = collect(tree).find((n) => n.props['data-astk'] === 'events-reload')
+check('事件表有重新加载按钮', reloadBtn !== undefined)
+const before = fetchCalls.filter((u) => u.includes('/astock/api/events')).length
+reloadBtn.props.onClick()
+tree = render()
+await tick(); await tick()
+check('点重新加载会重新取事件', fetchCalls.filter((u) => u.includes('/astock/api/events')).length > before)
 check('港股缺换手率/市净率时显示破折号而非 0', (hkText.match(/换手率—/) || hkText.match(/换手率\s*—/)) !== null, '')
 
 click('策略配置')
