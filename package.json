@@ -1,0 +1,57 @@
+{
+  "name": "dsh-astock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A股量化工作台：自选股管理、K线图、公司财务数据、策略配置与回测。 · A-share quant workbench for DeepSeek Harness.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hzy1522/dsh-astock.git"
+  },
+  "homepage": "https://github.com/hzy1522/dsh-astock#readme",
+  "bugs": {
+    "url": "https://github.com/hzy1522/dsh-astock/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/engine.test.mjs && node tests/host.test.mjs && node tests/client.test.mjs",
+    "test:engine": "node tests/engine.test.mjs",
+    "test:host": "node tests/host.test.mjs",
+    "test:client": "node tests/client.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "a-share",
+    "hongkong-stock",
+    "quant",
+    "backtest"
+  ]
+}

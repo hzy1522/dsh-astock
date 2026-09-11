@@ -1,0 +1,21 @@
+name: test
+
+# 只跑完全离线的那一套。
+# engine.test.mjs 只读 tests/fixtures/ 里的真实日线数据，不碰网络，结果确定。
+# host.test.mjs / client.test.mjs 要打腾讯与东财的真实接口，放进 CI 会因为上游
+# 限流而不稳定，因此留给本地手动跑。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 策略与回测引擎离线回归
+        run: node tests/engine.test.mjs
