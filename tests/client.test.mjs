@@ -553,6 +553,35 @@ const hkEventText = collectText(tree)
 check('港股事件为空时说明原因', hkEventText.includes('港股事件来自港交所公告'), (hkEventText.match(/港股事件来自[^。]*/) || ['未找到原因'])[0])
 click('策略配置')
 check('没有事件数据时在 AI 面板预警', collect(tree).some((n) => n.props['data-astk'] === 'no-events-warn'))
+// 手动添加：上游读不到、或数据源里根本没有的日期，用户自己填。
+click('公司数据')
+const addPosts = () => fetchCalls.filter((u) => u.includes('/astock/api/custom-events')).length
+const beforeAdd = addPosts()
+const lastPost = () => fetchBodies.map((b) => { try { return JSON.parse(b) } catch { return {} } })
+  .filter((b) => Array.isArray(b.items)).pop()
+const dateIn = collect(tree).find((n) => n.props['data-astk'] === 'event-date-in')
+const titleIn = collect(tree).find((n) => n.props['data-astk'] === 'event-title-in')
+check('事件表有手动添加输入框', dateIn !== undefined && titleIn !== undefined)
+dateIn.props.onChange({ target: { value: '2026-10-15' } })
+tree = render()
+collect(tree).find((n) => n.props['data-astk'] === 'event-title-in').props.onChange({ target: { value: '秋季新品发布会' } })
+tree = render()
+collect(tree).find((n) => n.props['data-astk'] === 'event-add').props.onClick()
+tree = render()
+await tick(); await tick()
+tree = render()
+check('手动添加发出了保存请求', addPosts() === beforeAdd + 1, addPosts() + ' 次')
+check('手动添加带上了日期/名称/来源',
+  lastPost().items.some((x) => x.date === '2026-10-15' && x.title === '秋季新品发布会' && x.addedBy === 'manual'),
+  JSON.stringify(lastPost().items))
+check('添加后清空了草稿',
+  collect(tree).filter((n) => n.type === 'input').every((n) => String(n.props.value) !== '2026-10-15'))
+// 日期没填时不能瞎写
+collect(tree).find((n) => n.props['data-astk'] === 'event-add').props.onClick()
+tree = render()
+await tick()
+check('没选日期时不发请求', addPosts() === beforeAdd + 1)
+
 // 上游限流是一时的：得让用户能自己重试，而不是等 30 分钟缓存过期。
 click('公司数据')
 const reloadBtn = collect(tree).find((n) => n.props['data-astk'] === 'events-reload')

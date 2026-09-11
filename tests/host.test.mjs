@@ -484,6 +484,15 @@ console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效
   const cleared = await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
   check('清空后不再返回自定义事件', cleared.body.events.every((e) => e.kind !== 'custom'))
 
+  // 手动添加：与 AI 候选走同一条路，来源要区分开
+  const manual = await call('/astock/api/custom-events', {
+    body: { code: '600519', items: [{ date: '2026-10-15', title: '秋季新品发布会', addedBy: 'manual' }] },
+  })
+  const manualEvent = manual.body.events.find((e) => e.kind === 'custom')
+  check('手动添加的事件标为手工来源', manualEvent.source === '手工添加（未核实）', manualEvent.source)
+  check('手动添加的事件同样未核实', manualEvent.verified === false)
+  await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
+
   const bad = await call('/astock/api/custom-events', { body: { code: 'NOPE', items: [] } })
   check('非法代码返回 500 + error', bad.status === 500 && typeof bad.body.error === 'string', bad.body.error)
 }

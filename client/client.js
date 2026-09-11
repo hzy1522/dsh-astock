@@ -97,6 +97,7 @@ window.__ModuleLoader__.load({
       '.astk-unverified{color:var(--dsw-alias-label-secondary);font-size:11.5px;margin-left:6px}',
       '.astk-unverified a{color:inherit;text-decoration:underline}',
       '.astk-btn-mini{padding:1px 6px;font-size:11.5px}',
+      '.astk-field-in{padding:4px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -1336,6 +1337,8 @@ window.__ModuleLoader__.load({
         fins: [], finsError: '', finsLoading: false,
         events: [], eventsError: '', eventsLoading: false, eventCounts: null,
         eventsNote: '', eventsErrors: [],
+        // 手动添加事件的草稿
+        eventDateDraft: '', eventTitleDraft: '',
         // AI 联网查到的候选事件：要用户点一下确认，才会变成自定义事件参与回测。
         suggestedEvents: [], eventsBusy: false,
         span: 250, offset: 0, hover: null,
@@ -1465,12 +1468,16 @@ window.__ModuleLoader__.load({
        * @param note - 传 'accepted' 表示这批来自 AI 候选，成功后清掉候选区。
        */
       function saveCustomEvents(code, items, note) {
+        const count = items.length
         store.set({ eventsBusy: true })
         apiPost('custom-events', { code, items })
           .then((res) => {
             const patch = {
               events: Array.isArray(res.events) ? res.events : [],
               eventCounts: res.counts || null, eventsBusy: false,
+            }
+            if (note !== 'accepted') {
+              store.set({ note: '已保存 ' + count + ' 个自定义事件（未核实），策略里用 EVCUS(n) 引用' })
             }
             if (note === 'accepted') {
               patch.suggestedEvents = []
@@ -2120,6 +2127,31 @@ window.__ModuleLoader__.load({
             React.createElement('div', { className: 'astk-note' },
               '「财报披露」用的是**预约披露日**而不是实际披露日：预约时间表是交易所期初公布的，用它做「财报前卖出」是合规的；'
               + '用实际披露日等于提前知道了财报哪天出。除权除息日与会议日期同样都有公告日在前。'),
+            React.createElement('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginTop: '8px' } },
+              React.createElement('input', {
+                type: 'date', className: 'astk-field-in', 'data-astk': 'event-date-in',
+                value: s.eventDateDraft, onChange: (e) => store.set({ eventDateDraft: e.target.value }),
+              }),
+              React.createElement('input', {
+                type: 'text', className: 'astk-field-in', placeholder: '事件名称（如：秋季新品发布会）',
+                'data-astk': 'event-title-in', value: s.eventTitleDraft,
+                onChange: (e) => store.set({ eventTitleDraft: e.target.value }),
+                style: { minWidth: '220px', flex: '1 1 220px' },
+              }),
+              React.createElement('button', {
+                className: 'astk-btn',
+                'data-astk': 'event-add',
+                disabled: s.eventsBusy,
+                onClick: () => {
+                  const date = store.get().eventDateDraft
+                  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { store.set({ note: '请先选一个日期' }); return }
+                  const title = store.get().eventTitleDraft.trim() || '自定义事件'
+                  const existing = store.get().events.filter((e) => e.kind === 'custom')
+                    .map((e) => ({ date: e.date, title: e.title, announcedAt: e.announcedAt, source: e.url, addedBy: e.source.includes('手工') ? 'manual' : 'ai' }))
+                  saveCustomEvents(store.get().selected, existing.concat([{ date, title, addedBy: 'manual' }]))
+                  store.set({ eventDateDraft: '', eventTitleDraft: '' })
+                },
+              }, '＋ 手动添加')),
             React.createElement('div', { style: { marginTop: '8px' } },
               React.createElement('button', {
                 className: 'astk-btn',
