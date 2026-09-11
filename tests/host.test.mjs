@@ -197,7 +197,10 @@ console.log('\n[9] AI 生成策略（mock llm）')
     && sent.messages[0].role === 'user' && sent.messages[0].content[0].type === 'text'
     && sent.messages[0].source.kind === 'plugin' && sent.messages[0].source.plugin === 'astock')
   check('用户描述进了提示', sent.messages[0].content[0].text.includes('收盘价上穿 5 日线买入'))
-  check('设了温度与上限', sent.temperature === 0.2 && sent.maxTokens === 2048)
+  check('设了温度与充足上限', sent.temperature === 0.2 && sent.maxTokens >= 8192, 'maxTokens=' + sent.maxTokens)
+  // 回归：曾经把默认选型的 reasoningEffort=high 透传下去，思考 token 与正文
+  // 共用 maxTokens，结果 2048 全被思考吃掉、text-delta 为 0。
+  check('不强制 reasoningEffort（避免思考挤占正文）', sent.reasoningEffort === undefined, String(sent.reasoningEffort))
 
   // 现有代码会被带进去让模型在其基础上改
   llmCalls.length = 0
@@ -216,10 +219,31 @@ console.log('\n[9] AI 生成策略（mock llm）')
   const failed = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
   check('finish=error 时转成可读错误', failed.status === 500 && String(failed.body.error).includes('额度不足'), failed.body.error)
 
-  // 模型返回空内容
+  // 模型返回空内容（stop）
   llmChunks = [{ type: 'finish', reason: { kind: 'stop' } }]
   const blank = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
   check('模型返回空内容时报错', blank.status === 500 && String(blank.body.error).includes('没有返回'), blank.body.error)
+
+  // 最要命的那个失败模式：思考吃光预算、正文一个字符都没有。
+  // 错误必须说清是「被截断」并给出可操作建议，而不是一句「没有返回内容」。
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'reasoning-delta', index: 0, text: '思考'.repeat(200) },
+    { type: 'usage', usage: { inputTokens: 64, outputTokens: 2048, reasoningTokens: 2048 } },
+    { type: 'finish', reason: { kind: 'max-tokens' } },
+  ]
+  const truncated = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
+  const truncMsg = String(truncated.body.error)
+  check('思考吃光预算时明确说是被截断', truncated.status === 500 && truncMsg.includes('截断'), truncMsg)
+  check('截断诊断带上了思考 token 数与上限',
+    truncMsg.includes('2048') && truncMsg.includes(String(llmCalls[0].maxTokens)), truncMsg)
+  check('截断诊断给出可操作建议', truncMsg.includes('重试') || truncMsg.includes('思考强度'), truncMsg)
+  check('截断诊断带上思考字符数', truncMsg.includes('思考了'), truncMsg)
+
+  // aborted 也要有可读信息
+  llmChunks = [{ type: 'finish', reason: { kind: 'aborted', failure: { message: '用户取消', code: 'ABORT' } } }]
+  const aborted = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
+  check('aborted 转成可读错误', aborted.status === 500 && String(aborted.body.error).includes('中断'), aborted.body.error)
 
   // 未挂载 llm 服务
   const savedLlm = services.llm

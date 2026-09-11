@@ -219,7 +219,7 @@ tests/
 ```bash
 pnpm test                 # 三套全跑
 node tests/engine.test.mjs   # 策略与回测引擎（纯离线，43 项）
-node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明（97 项）
+node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + AI 生成诊断（103 项）
 node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子（120 项）
 ```
 
