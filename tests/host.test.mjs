@@ -197,10 +197,13 @@ console.log('\n[7b] 事件路由（真实日期）')
   check('每条事件都有合法日期', events.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date)),
     JSON.stringify(events.filter((e) => !/^\d{4}-\d{2}-\d{2}$/.test(e.date))))
   check('每条事件都有类型与标题', events.every((e) => typeof e.kind === 'string' && e.kind !== '' && typeof e.title === 'string'))
-  check('包含了说明会事件（发布会类）', events.some((e) => e.kind === 'meeting'),
-    JSON.stringify(events.filter((e) => e.kind === 'meeting').map((e) => e.date)))
-  check('包含了财报预约披露', events.some((e) => e.kind === 'report'))
+  // 会议日期只能从公告正文里读，而正文接口偶发限流（ECONNRESET）。这时**允许没有
+  // meeting 事件，但必须给出 errors**——「悄悄变少」才是真问题。
+  const bodyBlocked = Array.isArray(res.body.errors) && res.body.errors.some((x) => x.includes('正文抓取失败'))
   const meetings = events.filter((e) => e.kind === 'meeting')
+  check('包含了说明会事件（或明确报告正文被限流）', meetings.length > 0 || bodyBlocked,
+    meetings.length > 0 ? meetings.map((e) => e.date).join(',') : '正文接口不可用：' + JSON.stringify(res.body.errors))
+  check('包含了财报预约披露', events.some((e) => e.kind === 'report'))
   // 会议日期必须晚于公告日、且不能离得太远——否则多半是从正文里抓错了日期。
   check('会议日期都在其公告日之后',
     meetings.every((e) => e.announcedAt !== null && e.date >= e.announcedAt),
@@ -410,6 +413,27 @@ console.log('\n[9b] 联网查证（多轮工具调用）')
   check('失败的工具结果标了 isError',
     llmCalls[1].messages.some((m) => m.content.some((c) => c.type === 'tool-result' && c.isError === true)))
 
+  // 没有事件数据的股票：必须**明确告诉模型**别用事件因子，否则生成的策略一跑就报错。
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: 'return { buy: GT(C, MA(C, 20)), sell: LT(C, MA(C, 20)) }' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const noEvents = await call('/astock/api/generate-strategy', { body: { description: '说明会前一天卖出', code: '999999' } })
+  const noEventPrompt = llmCalls[0].messages[0].content[0].text
+  check('没有事件数据时事件条数为 0', noEvents.body.events === 0, String(noEvents.body.events))
+  check('提示里明确说没有事件数据', noEventPrompt.includes('没有可用的事件数据'), noEventPrompt.slice(0, 80))
+  check('提示里禁止使用交易所事件因子',
+    noEventPrompt.includes('禁止') && noEventPrompt.includes('EVMEET') && noEventPrompt.includes('EVDIV'))
+  check('提示里给出 EVCUS 与替代策略两条出路',
+    noEventPrompt.includes('EVCUS') && noEventPrompt.includes('不依赖事件'))
+  check('有事件数据的股票不会有这段警告',
+    !(await (async () => {
+      llmCalls.length = 0
+      await call('/astock/api/generate-strategy', { body: { description: '随便', code: '600519' } })
+      return llmCalls[0].messages[0].content[0].text.includes('没有可用的事件数据')
+    })()))
+
   // 宿主没挂 web：静默降级，但要说清楚「这次没联网」。
   webAvailable = false
   llmCalls.length = 0
@@ -455,13 +479,71 @@ console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效
   // 自定义事件必须能从 events 路由读到（列表有进程内缓存，写入时要失效）。
   const reread = await call('/astock/api/events', { query: 'code=600519' })
   check('自定义事件出现在事件列表里', reread.body.events.some((e) => e.kind === 'custom'))
-  check('交易所事件没有被替代', reread.body.events.some((e) => e.kind === 'meeting'))
+  check('交易所事件没有被替代', reread.body.events.some((e) => e.kind === 'report'))
 
   const cleared = await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
   check('清空后不再返回自定义事件', cleared.body.events.every((e) => e.kind !== 'custom'))
 
   const bad = await call('/astock/api/custom-events', { body: { code: 'NOPE', items: [] } })
   check('非法代码返回 500 + error', bad.status === 500 && typeof bad.body.error === 'string', bad.body.error)
+}
+
+console.log('\n[7c] 港股事件（繁体 + 中文数字日期 + 董事会会议日期）')
+{
+  // 纯函数：中文数字日期解析。港股公告常写「謹訂於二零二六年五月十三日」。
+  const { cnNumber, tokenNumber, meetingDateOf, isoFromDay, extractEventsBlock, noEventNotice } = host.__test
+  check('中文数字：逐字读的年份', cnNumber('二零二六') === 2026, String(cnNumber('二零二六')))
+  check('中文数字：十', cnNumber('十') === 10 && cnNumber('十三') === 13 && cnNumber('三十一') === 31,
+    [cnNumber('十'), cnNumber('十三'), cnNumber('三十一')].join(','))
+  check('中文数字：普通数字', cnNumber('八') === 8 && cnNumber('十二') === 12)
+  check('中文数字：解析不了就返回 null', cnNumber('二零二六年') === null && cnNumber('') === null)
+  check('tokenNumber 两种写法都吃', tokenNumber('5') === 5 && tokenNumber('五') === 5)
+  check('isoFromDay 校验真实日期', isoFromDay(2026, 2, 30) === null && isoFromDay(2026, 5, 13) === '2026-05-13')
+
+  // 会议日期：繁体 + 中文数字 + 「謹訂於…舉行」
+  const hkNotice = '茲通告騰訊控股有限公司謹訂於二零二六年五月十三日（星期三）下午三時正假座香港四季酒店舉行股東週年大會'
+  check('从繁体中文数字里提取会议日期', meetingDateOf(hkNotice, '2026-04-09') === '2026-05-13',
+    String(meetingDateOf(hkNotice, '2026-04-09')))
+  // 港股常见写法：將於 2026 年 8 月 4 日召開董事會…（帶空格）
+  const boardNotice = '本公司宣布將於 2026 年 8 月 4 日召開董事會下設委員會會議，審議中期業績'
+  check('从「將於…召開」里提取日期', meetingDateOf(boardNotice, '2026-07-23') === '2026-08-04',
+    String(meetingDateOf(boardNotice, '2026-07-23')))
+  // 日期明显不合常理（早于公告日 / 太远）必须拒绝，否则就是从正文里抓错了日期
+  check('日期早于公告日时拒绝', meetingDateOf(hkNotice, '2026-06-01') === null)
+  check('日期离公告日太远时拒绝', meetingDateOf(hkNotice, '2025-01-01') === null)
+
+  // 真实港股：腾讯（繁体 + 中文数字 + 董事会会议日期）
+  const tencent = await call('/astock/api/events', { query: 'code=00700' })
+  check('港股 HTTP 200', tencent.status === 200, JSON.stringify(tencent.body).slice(0, 120))
+  const hkEvents = tencent.body.events
+  check('港股有事件（不再返回空列表）', hkEvents.length > 0, JSON.stringify(tencent.body.counts))
+  check('港股有财报事件（董事会会议日期 = 港股版预约披露）',
+    hkEvents.some((e) => e.kind === 'report'), JSON.stringify(hkEvents.map((e) => e.kind + ' ' + e.date)))
+  check('港股事件日期合法', hkEvents.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date)))
+  // announcedAt < date 说明日期是从正文里提取出来的（退回公告日的话两者相等）。
+  // announcedAt < date = 日期是从正文里提取出来的（退回公告日的话两者相等）。
+  const preAnnounced = hkEvents.filter((e) => e.announcedAt !== null && e.announcedAt < e.date)
+  const hkBlocked = Array.isArray(tencent.body.errors) && tencent.body.errors.some((x) => x.includes('正文抓取失败'))
+  check('港股存在提前公布的事件（或明确报告正文被限流）', preAnnounced.length > 0 || hkBlocked,
+    preAnnounced.length > 0 ? JSON.stringify(preAnnounced.map((e) => e.announcedAt + '->' + e.date)) : '正文接口不可用')
+  check('errors 是数组', Array.isArray(tencent.body.errors), JSON.stringify(tencent.body.errors))
+
+  const xiaomi = await call('/astock/api/events', { query: 'code=01810' })
+  check('另一只港股也有事件', xiaomi.body.events.length > 0, JSON.stringify(xiaomi.body.counts))
+
+  // 候选事件区块的校验：不合法的日期直接丢掉
+  const parsed = extractEventsBlock('```events\n' + JSON.stringify([
+    { date: '2026-09-09', title: '发布会' },
+    { date: '2026/09/10', title: '格式不对' },
+  ]) + '\n```')
+  check('候选事件只留下合法日期', parsed.length === 1 && parsed[0].date === '2026-09-09', JSON.stringify(parsed))
+  check('没有 events 区块时返回空数组', extractEventsBlock('return { buy: [], sell: [] }').length === 0)
+
+  // 没有事件数据时给模型的说明必须明确禁止事件因子
+  const notice = noEventNotice('00005', '汇丰控股', { note: '港股最近 100 条公告里没有这类文件', errors: [] })
+  check('无事件说明里禁用了交易所事件因子', notice.includes('禁止') && notice.includes('EVMEET'))
+  check('无事件说明里给出联网与替代两条出路', notice.includes('EVCUS') && notice.includes('不依赖事件'))
+  check('无事件说明里带上了原因', notice.includes('港股最近 100 条公告里没有这类文件'))
 }
 
 console.log('\n[10] 港股')

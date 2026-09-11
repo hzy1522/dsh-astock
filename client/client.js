@@ -1335,6 +1335,7 @@ window.__ModuleLoader__.load({
         quote: null, quoteError: '',
         fins: [], finsError: '', finsLoading: false,
         events: [], eventsError: '', eventsLoading: false, eventCounts: null,
+        eventsNote: '', eventsErrors: [],
         // AI 联网查到的候选事件：要用户点一下确认，才会变成自定义事件参与回测。
         suggestedEvents: [], eventsBusy: false,
         span: 250, offset: 0, hover: null,
@@ -1445,6 +1446,8 @@ window.__ModuleLoader__.load({
             store.set({
               events: Array.isArray(res.events) ? res.events : [],
               eventCounts: res.counts || null, eventsLoading: false,
+              eventsNote: String(res.note || ''),
+              eventsErrors: Array.isArray(res.errors) ? res.errors : [],
             })
           })
           .catch((error) => {
@@ -1577,7 +1580,7 @@ window.__ModuleLoader__.load({
           let note = '已由 ' + String(res.model || '模型') + ' 生成'
           if (res.usage && typeof res.usage.outputTokens === 'number') note += '（输出 ' + res.usage.outputTokens + ' tokens）'
           if (res.events > 0) note += '，已把该股 ' + res.events + ' 条真实事件日期交给模型'
-          else if (s.selected) note += '，但没取到该股的事件日期（需要事件因子的策略可能不准）'
+          else if (s.selected) note += '，但该股没有可用的事件数据（已在提示里明确告诉模型不要用事件因子）'
           // 联网查证：搜了几次、有没有查不到、有没有降级，都要如实说。
           if (res.searched) note += '，联网查证 ' + String(res.searches || 0) + ' 次'
           else if (res.searchError) note += '，未能联网查证（' + String(res.searchError) + '）'
@@ -1586,8 +1589,11 @@ window.__ModuleLoader__.load({
           try {
             const bars = store.get().bars
             if (bars && bars.length >= 30) {
-              runJsStrategy(code, seriesOf(bars, null, store.get().events))
-              note += '，已通过试运行校验'
+              // 试运行要把**候选事件**也算进去：策略引用的正是这些还没确认的日期，
+              // 否则明明能用也会先报一次错，白白吓人一跳。
+              const trialEvents = store.get().events.concat(suggested)
+              runJsStrategy(code, seriesOf(bars, null, trialEvents))
+              note += suggested.length > 0 ? '，已按「交易所事件 + 待确认候选事件」试运行通过' : '，已通过试运行校验'
             }
           } catch (error) {
             note += '；但试运行报错：' + String((error && error.message) || error)
@@ -2105,7 +2111,7 @@ window.__ModuleLoader__.load({
                   React.createElement('tbody', null, eventRows))
               : (s.eventsLoading || s.eventsError ? null
                 : React.createElement('div', { className: 'astk-note' },
-                    '没有取到事件日期。港股公告的数据源与 A 股不同，目前可能为空。')),
+                    s.eventsNote || '没有取到事件日期。')),
             React.createElement('div', { className: 'astk-note' },
               '事件日期来自交易所公告与预约披露时间表，都是**事先公开**过的日期，所以可以安全地用在回测里。'
               + '策略里用 EV(n) / EVMEET(n) / EVREP(n) / EVDIV(n) 引用：n 是相对该事件的第 n 个交易日，'
@@ -2336,7 +2342,13 @@ window.__ModuleLoader__.load({
                     'AI 改写会覆盖文本框里的内容，旧代码留在这里随时可换回来。'))
               : null,
             React.createElement('div', { className: 'astk-note' },
-              'AI 生成的策略代码仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'))
+              'AI 生成的策略代码仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'),
+            // 没有事件数据时先说清楚：否则用户会拿到一个一跑就报错的事件策略。
+            s.selected && !s.eventsLoading && s.events.length === 0
+              ? React.createElement('div', { className: 'astk-warn', 'data-astk': 'no-events-warn' },
+                  '注意：当前股票没有可用的事件数据，事件类需求（说明会 / 财报日 / 除权除息前买卖）跑不起来。'
+                  + '可以指望 AI 联网查到真实日期（会先给你确认），或者换一只股票。')
+              : null)
 
           content = React.createElement('div', null,
             rangeSection,

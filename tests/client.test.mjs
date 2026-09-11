@@ -179,7 +179,14 @@ globalThis.fetch = async (url, init) => {
     if (!eventsAvailable) return { ok: false, status: 500, json: async () => ({ error: '事件取数失败' }) }
     const code = new URLSearchParams(search || '').get('code')
     if (code !== '600519') {
-      return { ok: true, status: 200, json: async () => ({ code, market: 'hk', events: [], counts: { meeting: 0, report: 0, exdiv: 0, custom: 0 } }) }
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          code, market: 'hk', events: [], counts: { meeting: 0, report: 0, exdiv: 0, custom: 0 },
+          errors: [],
+          note: '港股事件来自港交所公告：只识别「董事会会议召开日期」与股东大会通告。',
+        }),
+      }
     }
     const custom = customEvents.map((it) => ({
       date: it.date, kind: 'custom', title: it.title, announcedAt: it.announcedAt || null, actual: null,
@@ -506,6 +513,9 @@ check('写入时带上来源与公告日',
   JSON.stringify(customEvents.find((x) => x.date === '2026-09-09')))
 check('确认后候选区块收起', collect(tree).every((n) => n.props['data-astk'] !== 'suggested-events'))
 check('确认后给出反馈', collectText(tree).includes('已把 3 个日期加入该股自定义事件'))
+// 试运行必须把「待确认的候选事件」算进去，否则明明能用也会先报一次错。
+check('试运行把候选事件算进去了', collectText(tree).includes('已按「交易所事件 + 待确认候选事件」试运行通过'),
+  (collectText(tree).match(/已按[^；]*试运行通过/) || ['未找到'])[0])
 
 // 接口失败：显示可读错误
 generateError = '模型调用失败：配额不足'
@@ -536,6 +546,13 @@ check('切到港股并加载行情', fetchCalls.some((u) => u.includes('quote') 
 check('行情条标出港股', hkText.includes('港股') && hkText.includes('汇丰控股'))
 check('显示币种 HKD', hkText.includes('HKD'))
 check('显示每手 400 股', hkText.includes('每手股数') && hkText.includes('400'), (hkText.match(/每手股数\s*400/) || [''])[0])
+
+// 事件为空时不能只说「没有」——宿主给了原因就要显示出来，并且提醒事件类策略跑不了。
+click('公司数据')
+const hkEventText = collectText(tree)
+check('港股事件为空时说明原因', hkEventText.includes('港股事件来自港交所公告'), (hkEventText.match(/港股事件来自[^。]*/) || ['未找到原因'])[0])
+click('策略配置')
+check('没有事件数据时在 AI 面板预警', collect(tree).some((n) => n.props['data-astk'] === 'no-events-warn'))
 check('港股缺换手率/市净率时显示破折号而非 0', (hkText.match(/换手率—/) || hkText.match(/换手率\s*—/)) !== null, '')
 
 click('策略配置')
