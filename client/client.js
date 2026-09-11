@@ -403,7 +403,7 @@ window.__ModuleLoader__.load({
           else if (callName === 'MIN') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.min(v, A[1][i])))
           // ---- 事件因子：真实事件日期 + 交易日换算，全部来自公开数据 ----
           else if (EV_FNS.indexOf(callName) >= 0) {
-            if (!S.EV) throw new Error('事件因子需要公司事件数据（说明会 / 财报预约披露 / 除权除息 / 自定义事件），这只股票没取到，可到「公司数据」页确认')
+            if (!S.EV) throw new Error('事件因子需要事件数据（说明会 / 财报预约披露 / 除权除息 / 自定义事件），这只股票当前没有；可以到「公司数据」页手动添加日期，或让 AI 联网查证后再确认')
             if (node.args.length === 0) throw new Error(callName + ' 需要一个交易日偏移参数，例如 ' + callName + '(-1)')
             out = eventFactor(S, callName, EV_KIND[callName], constArg(A[0], callName))
           }
@@ -1667,6 +1667,8 @@ window.__ModuleLoader__.load({
           } else if (res.searchError) {
             searchNote = '联网查证失败：' + String(res.searchError).slice(0, 240)
           }
+          // 策略还指着不存在的事件：把出路写清楚，别让用户对着跑不通的策略发呆。
+          if (res.eventAdvice) searchNote = (searchNote === '' ? '' : searchNote + '　') + String(res.eventAdvice)
           if (suggested.length > 0) note += '，查出 ' + suggested.length + ' 个候选日期待你确认'
 
           const patch = { aiNote: note, aiError: '', suggestedEvents: suggested, chatBusy: false, aiBusy: false, searchNote }
@@ -2515,6 +2517,8 @@ window.__ModuleLoader__.load({
                   React.createElement('h4', null, 'AI 查到的候选事件（需要你确认）'),
                   React.createElement('div', { className: 'astk-note' },
                     '这些日期是模型联网查到的，**没有经过交易所数据核对**。确认后它们会成为「自定义事件」，在「公司数据」页标为未核实，策略里用 EVCUS(n) 引用。'),
+                  React.createElement('div', { className: 'astk-warn' },
+                    '上面的策略用的是这些日期：**不点「确认加入」就直接回测会报错**（事件数据还不存在）。确认后重新回测即可。'),
                   s.suggestedEvents.map((ev, i) => React.createElement('div', { key: 'sg' + i, className: 'astk-cond' },
                     React.createElement('span', { className: 'astk-cond-t' }, ev.date + '　' + ev.title),
                     React.createElement('span', { className: 'astk-cond-v' },

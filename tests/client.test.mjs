@@ -630,6 +630,26 @@ console.log('\n[5c2] 多轮对话 + 表达式模式')
   check('反问时不改动编辑器', byData('buy-expr').props.value === buyBefore, byData('buy-expr').props.value)
   check('反问时标明本轮未改动策略', collectText(tree).includes('本轮只回答，未改动策略'))
 
+// 策略还指着不存在的事件时：把三条出路写清楚
+generateFixture = {
+  mode: 'expr', expr: { buy: 'EVCUS(1)', sell: 'EVCUS(-1)' },
+  provider: 'stub', model: 'stub-model', reply: '查不到发布日期。', usage: { outputTokens: 18 },
+  eventAdvice: '这段策略引用了 EVCUS，但该股当前没有对应的事件数据，直接回测会报错。三条出路：① 再追问一次…；② 到「公司数据」页用手动添加把日期填进去；③ 让它改成不依赖事件因子的写法。',
+}
+send('小米产品发布会之前卖出')
+await tick(); await tick()
+tree = render()
+const adviceText = collectText(tree)
+check('查不到事件时给出出路', adviceText.includes('三条出路') && adviceText.includes('手动添加'), (adviceText.match(/三条出路[^。]*/) || ['未找到'])[0])
+// 复原两种模式各一条能跑的普通策略：后面的用例（港股每手股数）依赖这个状态。
+byData('mode-expr').props.onClick()
+tree = render()
+setField('buy-expr', 'CROSS(MA(5),MA(20))')
+setField('sell-expr', 'CROSS(MA(20),MA(5))')
+byData('mode-js').props.onClick()
+tree = render()
+setField('js-source', 'const fast = MA(C, 5)\nconst slow = MA(C, 20)\nreturn { buy: CROSS(fast, slow), sell: CROSS(slow, fast) }')
+
 // 宿主搜索坏了、但内置检索顶上时：必须说清楚「这次用的不是宿主搜索」以及怎么修
 generateFixture = {
   code: 'return { buy: GT(C, MA(C, 20)), sell: LT(C, MA(C, 20)) }',
@@ -1240,7 +1260,7 @@ check('事件取数失败时页面给出错误', collectText(tree).includes('事
 click('策略配置')
 const evFail = await runBacktestNow()
 check('没有事件数据时策略给出可读错误',
-  evFail.includes('事件因子需要公司事件数据'),
+  evFail.includes('事件因子需要事件数据') && evFail.includes('手动添加日期'),
   (evFail.match(/JS 策略错误[^]{0,60}/) || ['无错误信息'])[0])
 eventsAvailable = true
 

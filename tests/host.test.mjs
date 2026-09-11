@@ -601,6 +601,120 @@ console.log('\n[9b2] 内置财经资讯检索（宿主搜索不可用时的兜�
   check('内置检索没有结果时也算失败', dead.source === 'builtin' || dead.source === 'none', dead.source)
 }
 
+console.log('\n[9b3] 用了不存在的事件因子：强制补一轮联网查证')
+{
+  // 复现线上真实故障：事件列表里没有发布会，模型却在说明里声称「列表里已经有这个事件」，
+  // 然后写了 EVCUS(-1)。策略指向一个不存在的日期，而它一次搜索都没做。
+  const bogusRound = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '列表里已经有 2026-09-07「小米产品发布会」，已登记为自定义事件。\n```expr\n'
+        + JSON.stringify({ buy: 'EVCUS(1)==1', sell: 'EVCUS(-1)==1' }) + '\n```',
+    },
+    { type: 'usage', usage: { inputTokens: 100, outputTokens: 40 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const searchedRound = [
+    {
+      type: 'block-start', index: 0, blockType: 'tool-call',
+    },
+    { type: 'tool-call-delta', index: 0, id: 'call-9', name: 'web_search', argumentsDelta: '{"queries":["小米 新品发布会 日期"]}' },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+  const correctedRound = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '查到了：2026 年 9 月 7 日小米秋季旗舰新品发布会。\n```expr\n'
+        + JSON.stringify({ buy: 'EVCUS(1)==1', sell: 'EVCUS(-1)==1' }) + '\n```\n```events\n'
+        + JSON.stringify([{ date: '2026-09-07', title: '小米秋季旗舰新品发布会', source: 'https://example.com/xiaomi', evidence: '9月7日晚举行' }])
+        + '\n```',
+    },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+
+  searchCalls.length = 0
+  llmCalls.length = 0
+  // 第一轮就交卷（一次搜索都没做）→ 宿主必须补一轮，并且要求它去查
+  llmRounds = [bogusRound, searchedRound, correctedRound]
+  const res = await call('/astock/api/generate-strategy', {
+    body: { description: '小米产品发布会之前卖出，发布会后买入', mode: 'expr', code: '01810', history: [] },
+  })
+  llmRounds = null
+  check('补跑了第二轮模型调用', llmCalls.length === 3, llmCalls.length + ' 轮')
+  const corrective = llmCalls[1].messages.map((m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')).join('\n')
+  check('第二轮明确要求联网查证', corrective.includes('必须修正') && corrective.includes('web_search'), corrective.slice(0, 90))
+  check('第二轮点名了不能假设事件存在', corrective.includes('不能假设它存在'))
+  check('随后真的发起了搜索', searchCalls.length >= 1, JSON.stringify(searchCalls.map((c) => c.query)))
+  check('最终拿到了候选事件', Array.isArray(res.body.suggestedEvents) && res.body.suggestedEvents.length === 1,
+    JSON.stringify(res.body.suggestedEvents))
+  check('候选事件就是查到的发布会', res.body.suggestedEvents[0].date === '2026-09-07', JSON.stringify(res.body.suggestedEvents[0]))
+  check('最终表达式仍指向该事件', res.body.expr.sell === 'EVCUS(-1)==1', JSON.stringify(res.body.expr))
+  check('宿主如实回报搜过', res.body.searched === true && res.body.searches >= 1, String(res.body.searches))
+
+  // 只在「确实缺事件」时才追问：事件齐全时不该多跑一轮（避免无谓开销）
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '```expr\n' + JSON.stringify({ buy: 'CROSS(MA(5),MA(20))', sell: 'C<MA(20)' }) + '\n```' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/generate-strategy', { body: { description: '双均线', mode: 'expr', code: '600519', history: [] } })
+  check('不涉及缺失事件时只跑一轮', llmCalls.length === 1, llmCalls.length + ' 轮')
+}
+
+console.log('\n[9b4] 事件类需求：宿主先自己查一遍')
+{
+  const { eventHintBlock } = host.__test
+
+  // 非事件需求不该多花这次检索
+  check('非事件需求不预查', (await eventHintBlock('小米集团', '用双均线金叉买入', webStub)) === '')
+
+  // 事件类需求：宿主用内置检索把新闻摆到模型面前（含日期与来源）
+  const hint = await eventHintBlock('小米集团', '小米产品发布会之前卖出，产品发布会后买入', undefined)
+  check('事件需求会预查', hint.includes('网络检索参考'), hint.slice(0, 40))
+  check('预查结果来自内置财经资讯检索', hint.includes('内置财经资讯检索'), '')
+  check('预查里带上了股票名与查询词', hint.includes('小米集团') && hint.includes('发布会'))
+  check('明确要求只能从中取真实日期、找不到就说找不到',
+    hint.includes('不要编日期') && hint.includes('找不到就明说找不到'))
+  check('查到的结果带链接与日期', /\n  https?:\/\//.test(hint) && /\d{4}-\d{2}-\d{2}/.test(hint))
+
+  // 同一查询第二次走缓存（不再打上游）
+  searchCalls.length = 0
+  await eventHintBlock('小米集团', '小米产品发布会之前卖出，产品发布会后买入', undefined)
+  check('同样的查询走缓存', searchCalls.length === 0, searchCalls.length + ' 次上游请求')
+
+  // 整条链路：事件需求 → 提示词里出现预查块
+  llmCalls.length = 0
+  llmChunks = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '```expr\n' + JSON.stringify({ buy: 'EVCUS(1)', sell: 'EVCUS(-1)' }) + '\n```\n```events\n'
+        + JSON.stringify([{ date: '2026-09-07', title: '小米秋季旗舰新品发布会', source: 'https://example.com/x', evidence: '9月7日举行' }])
+        + '\n```',
+    },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const run = await call('/astock/api/generate-strategy', {
+    body: { description: '小米产品发布会之前卖出，发布会后买入', mode: 'expr', code: '01810', name: '小米集团', history: [] },
+  })
+  const promptText = llmCalls[0].messages.map((m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')).join('\n')
+  check('提示词里带上了网络检索参考', promptText.includes('网络检索参考'))
+  check('需求本身也照旧带上', promptText.includes('小米产品发布会之前卖出'))
+  check('这一轮还是把候选事件回报出来', run.body.suggestedEvents.length === 1, JSON.stringify(run.body.suggestedEvents))
+
+  // 非事件需求：提示词里不该出现预查块
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '```expr\n' + JSON.stringify({ buy: 'CROSS(MA(5),MA(20))', sell: 'C<MA(20)' }) + '\n```' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/generate-strategy', { body: { description: '双均线金叉买', mode: 'expr', code: '01810', name: '小米集团', history: [] } })
+  const plainPrompt = llmCalls[0].messages.map((m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')).join('\n')
+  check('非事件需求不加预查块', !plainPrompt.includes('网络检索参考'))
+}
+
 console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效）')
 {
   await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
