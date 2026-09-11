@@ -1237,7 +1237,7 @@ window.__ModuleLoader__.load({
         const q = s.quote
 
         const head = React.createElement('div', { className: 'astk-head' },
-          React.createElement('div', { className: 'astk-title' }, 'A股量化工作台'),
+          React.createElement('div', { className: 'astk-title' }, 'A股港股量化工作台'),
           React.createElement('div', { className: 'astk-res' },
             React.createElement('input', {
               className: 'astk-in',
@@ -1618,7 +1618,7 @@ window.__ModuleLoader__.load({
 
       ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'astock' }, Panel))
       ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
-        name: 'sidebar.panellist', id: 'astock', order: 60, label: 'A股量化',
+        name: 'sidebar.panellist', id: 'astock', order: 60, label: 'A股港股',
       }, Icon))
     }
 

@@ -1,10 +1,13 @@
 {
   "name": "dsh-astock",
   "version": "0.1.0",
-  "private": true,
-  "description": "A股量化工作台：自选股管理、K线图、公司财务数据、策略配置与回测。 · A-share quant workbench for DeepSeek Harness.",
+  "description": "A股 / 港股量化工作台：自选股、K线图、公司数据、策略配置与回测。 · A-share & Hong Kong stock quant workbench for DeepSeek Harness.",
   "type": "module",
   "license": "MIT",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hzy1522/dsh-astock.git"

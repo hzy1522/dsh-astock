@@ -139,7 +139,7 @@ check('注册了 2 个 slot', registrations.length === 2, registrations.map((r) 
 const mainReg = registrations.find((r) => r.meta.name === 'main')
 const iconReg = registrations.find((r) => r.meta.name === 'sidebar.panellist')
 check('main 面板注册', mainReg !== undefined && mainReg.meta.key === 'astock')
-check('侧边栏图标注册', iconReg !== undefined && iconReg.meta.id === 'astock' && iconReg.meta.label === 'A股量化', JSON.stringify(iconReg && iconReg.meta))
+check('侧边栏图标注册', iconReg !== undefined && iconReg.meta.id === 'astock' && iconReg.meta.label === 'A股港股', JSON.stringify(iconReg && iconReg.meta))
 check('注册了样式副作用', effectLabels.includes('dsh-astock:styles'), JSON.stringify(effectLabels.filter(Boolean)))
 
 // ---- 元素树工具 ----
@@ -187,7 +187,7 @@ check('Panel 渲染不抛错', threw === null, threw ? String(threw.message) + '
 if (threw) { console.log('\n渲染失败，后续检查跳过'); process.exit(1) }
 
 let text = collectText(tree)
-check('标题渲染', text.includes('A股量化工作台'))
+check('标题渲染', text.includes('A股港股量化工作台'))
 check('搜索框提示语', collect(tree).some((n) => n.type === 'input' && String(n.props.placeholder).includes('拼音')))
 check('四个标签页都在', ['K线', '公司数据', '策略配置', '回测'].every((t) => findButton(tree, t) !== undefined))
 check('渲染出根容器', collect(tree).some((n) => n.props.className === 'astk-root'))
