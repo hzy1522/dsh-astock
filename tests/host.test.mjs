@@ -77,7 +77,7 @@ console.log('[1] 插件契约')
 check('导出 name', host.name === 'astock', host.name)
 check('导出 inject 含 webServer', Array.isArray(host.inject) && host.inject.includes('webServer'), JSON.stringify(host.inject))
 check('导出 apply 函数', typeof host.apply === 'function')
-check('注册了 8 条路由', routes.size === 8, [...routes.keys()].join(', '))
+check('注册了 9 条路由', routes.size === 9, [...routes.keys()].join(', '))
 
 console.log('\n[2] health 路由')
 {
@@ -159,6 +159,38 @@ console.log('\n[7] watchlist 往返 + 校验（A 股与港股混排）')
   await call('/astock/api/watchlist', { body: { items: original } })
 }
 
+console.log('\n[7b] 事件路由（真实日期）')
+{
+  const res = await call('/astock/api/events', { query: 'code=600519' })
+  check('HTTP 200', res.status === 200, JSON.stringify(res.body).slice(0, 120))
+  const events = res.body.events
+  check('返回事件数组', Array.isArray(events) && events.length > 0, String(events && events.length))
+  check('每条事件都有合法日期', events.every((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date)),
+    JSON.stringify(events.filter((e) => !/^\d{4}-\d{2}-\d{2}$/.test(e.date))))
+  check('每条事件都有类型与标题', events.every((e) => typeof e.kind === 'string' && e.kind !== '' && typeof e.title === 'string'))
+  check('包含了说明会事件（发布会类）', events.some((e) => e.kind === 'meeting'),
+    JSON.stringify(events.filter((e) => e.kind === 'meeting').map((e) => e.date)))
+  check('包含了财报预约披露', events.some((e) => e.kind === 'report'))
+  const meetings = events.filter((e) => e.kind === 'meeting')
+  // 会议日期必须晚于公告日、且不能离得太远——否则多半是从正文里抓错了日期。
+  check('会议日期都在其公告日之后',
+    meetings.every((e) => e.announcedAt !== null && e.date >= e.announcedAt),
+    JSON.stringify(meetings.map((e) => e.announcedAt + '->' + e.date)))
+  check('会议日期离公告日不超过 120 天',
+    meetings.every((e) => (Date.parse(e.date) - Date.parse(e.announcedAt)) <= 120 * 86400000))
+  check('counts 与列表一致',
+    res.body.counts.meeting === meetings.length && res.body.counts.report === events.filter((e) => e.kind === 'report').length,
+    JSON.stringify(res.body.counts))
+  check('按日期倒序', events.every((e, i) => i === 0 || events[i - 1].date >= e.date))
+
+  // 港股：公告源不同，允许为空，但不能抛错
+  const hk = await call('/astock/api/events', { query: 'code=00700' })
+  check('港股不抛错（允许空列表）', hk.status === 200 && Array.isArray(hk.body.events), JSON.stringify(hk.body).slice(0, 100))
+
+  const bad = await call('/astock/api/events', { query: 'code=NOPE' })
+  check('非法代码返回 500 + error', bad.status === 500 && typeof bad.body.error === 'string', bad.body.error)
+}
+
 console.log('\n[8] 错误处理')
 {
   const bad = await call('/astock/api/quote', { query: 'code=NOPE' })
@@ -201,6 +233,26 @@ console.log('\n[9] AI 生成策略（mock llm）')
     && sent.messages[0].role === 'user' && sent.messages[0].content[0].type === 'text'
     && sent.messages[0].source.kind === 'plugin' && sent.messages[0].source.plugin === 'astock')
   check('用户描述进了提示', sent.messages[0].content[0].text.includes('收盘价上穿 5 日线买入'))
+  check('system 提示要求用事件因子且不许编日期', sent.system.includes('EVMEET') && sent.system.includes('绝不允许自己编造日期'))
+
+  // 带上股票代码：必须把该股**真实事件日期**交给模型，否则它只能编日期。
+  llmCalls.length = 0
+  const withCode = await call('/astock/api/generate-strategy', {
+    body: { description: '说明会前一个交易日卖出，会后第二个交易日买入', code: '600519' },
+  })
+  check('带 code 的生成仍然返回代码', withCode.status === 200 && typeof withCode.body.code === 'string', JSON.stringify(withCode.body).slice(0, 120))
+  check('回报了交给模型的事件条数', withCode.body.events > 0, String(withCode.body.events))
+  const prompt = llmCalls[0].messages[0].content[0].text
+  check('提示里有真实事件日期区块', prompt.includes('真实事件日期') && prompt.includes('EVMEET'))
+  check('提示里给出了具体日期', /\d{4}-\d{2}-\d{2}/.test(prompt), (prompt.match(/\d{4}-\d{2}-\d{2}/) || [''])[0])
+  check('提示里说明了交易日换算由引擎做', prompt.includes('你不要自己推算日历日期'))
+  check('提示里禁止编造不存在的日期', prompt.includes('不要编造日期'))
+
+  // 不带 code 时不该硬塞一个事件区块
+  llmCalls.length = 0
+  const noCode = await call('/astock/api/generate-strategy', { body: { description: '随便什么策略' } })
+  check('不带 code 时没有事件区块', !llmCalls[0].messages[0].content[0].text.includes('真实事件日期'))
+  check('不带 code 时事件条数为 0', noCode.body.events === 0, String(noCode.body.events))
   check('设了温度与充足上限', sent.temperature === 0.2 && sent.maxTokens >= 8192, 'maxTokens=' + sent.maxTokens)
   // 回归：曾经把默认选型的 reasoningEffort=high 透传下去，思考 token 与正文
   // 共用 maxTokens，结果 2048 全被思考吃掉、text-delta 为 0。

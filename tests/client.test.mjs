@@ -90,12 +90,35 @@ const INDEX_BARS = bars.map((b, i) => {
   const mid = 3500 + i * 1.1 + Math.sin(i / 5) * 30
   return [b[0], mid - 5, mid, mid + 6, mid - 6, 1.2e8]
 })
+// 事件夹具：日期直接取自真实 K 线，保证「第几个交易日」的期望值是可独立算出的。
+//   A：交易日当天开的说明会，公告在 10 个交易日前（可提前埋伏）
+//   B：日期落在两根 K 线**之间**（周末），验证「事件日不是交易日就顺延」
+//   C：会议当天才公告，验证「不能提前知道」——EVMEET(-1) 必须抓不到它
+const BAR_N = bars.length
+const dayAt = (i) => bars[i][0]
+const I_A = BAR_N - 100
+let I_B = BAR_N - 60
+while (I_B > 20 && Date.parse(dayAt(I_B)) - Date.parse(dayAt(I_B - 1)) < 3 * 86400000) I_B -= 1
+const I_C = BAR_N - 30
+const betweenDate = (a, b) => new Date((Date.parse(a) + Date.parse(b)) / 2).toISOString().slice(0, 10)
+const EVENTS = {
+  code: '600519',
+  market: 'cn',
+  events: [
+    { date: dayAt(I_A), kind: 'meeting', title: '2026年半年度业绩说明会', announcedAt: dayAt(I_A - 10), actual: null, source: 'stub' },
+    { date: betweenDate(dayAt(I_B - 1), dayAt(I_B)), kind: 'meeting', title: '三季度业绩说明会（非交易日）', announcedAt: dayAt(I_B - 10), actual: null, source: 'stub' },
+    { date: dayAt(I_C), kind: 'meeting', title: '当天才公告的说明会', announcedAt: dayAt(I_C), actual: null, source: 'stub' },
+    { date: dayAt(BAR_N - 200), kind: 'exdiv', title: '除权除息日', announcedAt: dayAt(BAR_N - 210), actual: null, source: 'stub' },
+  ],
+  counts: { meeting: 3, report: 0, exdiv: 1 },
+}
+let eventsAvailable = true
 // 让测试可以模拟「指数取不到」的情况
 let indexAvailable = true
 // AI 生成接口的响应可被测试改写，用来验证成功与失败两条路径。
 let generateFixture = {
   code: 'const fast = MA(C, 10)\nconst slow = MA(C, 30)\nreturn { buy: CROSS(fast, slow), sell: CROSS(slow, fast) }',
-  provider: 'stub', model: 'stub-model', usage: { inputTokens: 120, outputTokens: 42 },
+  provider: 'stub', model: 'stub-model', events: 27, usage: { inputTokens: 120, outputTokens: 42 },
 }
 let generateError = null
 // 免责声明：默认为「已确认」，其它用例才不会被确认弹窗干扰；
@@ -130,6 +153,14 @@ globalThis.fetch = async (url, init) => {
       return { ok: true, status: 200, json: async () => makeDisclaimer(true) }
     }
     return { ok: true, status: 200, json: async () => makeDisclaimer(disclaimerAccepted) }
+  }
+  if (key === 'events') {
+    if (!eventsAvailable) return { ok: false, status: 500, json: async () => ({ error: '事件取数失败' }) }
+    const code = new URLSearchParams(search || '').get('code')
+    if (code !== '600519') {
+      return { ok: true, status: 200, json: async () => ({ code, market: 'hk', events: [], counts: { meeting: 0, report: 0, exdiv: 0 } }) }
+    }
+    return { ok: true, status: 200, json: async () => EVENTS }
   }
   if (key === 'quote') {
     const code = new URLSearchParams(search || '').get('code')
@@ -404,6 +435,7 @@ check('发起了生成请求', fetchCalls.some((u) => u.includes('generate-strat
 check('生成的代码填入编辑器', jsEditorValue().includes('const fast = MA(C, 10)'), jsEditorValue().split('\n')[0])
 check('自动切到 JS 模式', aiText.includes('JavaScript：写任意代码'))
 check('提示带模型名与用量', aiText.includes('stub-model') && aiText.includes('42 tokens'))
+check('提示说明把真实事件日期交给了模型', aiText.includes('已把该股 27 条真实事件日期交给模型'))
 check('生成后立即试运行校验通过', aiText.includes('已通过试运行校验'))
 
 // 生成结果语法有错：仍填入便于手改，但提示试运行失败
@@ -839,6 +871,87 @@ check('提供换回改写前代码的入口', restoreBtn !== undefined)
 restoreBtn.props.onClick()
 tree = render()
 check('换回后编辑器内容是原策略', jsEditorValue() === rawSource, jsEditorValue().slice(0, 40))
+
+console.log('\n[5i] 事件因子：真实日期 + 交易日换算 + 不许提前知道')
+
+// 「公司开发布会的前一个交易日卖出、会后的第二个交易日买入」这类策略，缺的不是
+// 写代码的能力，而是真实日期。这一节验证：日期是真实的、交易日换算按 K 线做、
+// 而且**当天才公告的事件不许被提前埋伏**。
+eventsAvailable = true
+hookState.length = 0
+hookIndex = 0
+tree = render()
+await tick(); await tick(); await tick(); await tick()
+tree = render()
+
+// 1) 公司数据页要能看到真实事件日期（用户得先能看见，才谈得上用它）
+click('公司数据')
+const evText = collectText(tree)
+check('公司数据页有公司动态', evText.includes('公司动态'))
+const evDates = collect(tree).filter((n) => n.props['data-astk'] === 'event-date').map((n) => collectText(n))
+check('事件日期渲染出来了', evDates.includes(dayAt(I_A)) && evDates.includes(dayAt(I_C)), JSON.stringify(evDates))
+check('事件类型带徽标', evText.includes('说明会') && evText.includes('除权除息'))
+check('写明了事件日期事先公开', evText.includes('事先公开'))
+check('写明了用的是预约披露日', evText.includes('预约披露日'))
+
+click('策略配置')
+check('有事件因子模板', findButton(tree, '说明会前后') !== undefined)
+
+// 2) EVMEET 的语义：事件日映射、非交易日顺延、以及「当天才公告」的拦截
+useJs([
+  '// 会前一个交易日买、会后第 10 个交易日卖，全程只用真实事件日期',
+  'return {',
+  '  buy: EVMEET(-1),',
+  '  sell: EVMEET(10),',
+  '  why: (i) => "第 " + i + " 根：说明会前一个交易日",',
+  '}',
+].join('\n'))
+const evRun = await runBacktestNow()
+check('事件策略能跑通', !evRun.includes('错误'), (evRun.match(/JS 策略错误[^]{0,60}/) || [''])[0])
+// 事件 C 当天才公告：EVMEET(-1) 若抓到它就会多出第三笔交易。
+check('当天才公告的事件抓不到（只 2 笔交易）', tradesOf(evRun) === '2', tradesOf(evRun) + ' 笔')
+check('事件策略产生两根交易行', tRows().length === 2, tRows().length + ' 行')
+
+// 交易行是倒序渲染的：tRows()[0] 是最后一笔（事件 B）
+tRows()[1].props.onClick()
+tree = render()
+const evDetailA = collectText(tree)
+check('事件 A：买入信号落在会前一个交易日', evDetailA.includes('信号日 ' + dayAt(I_A - 1)),
+  (evDetailA.match(/信号日 [\d-]+/) || ['未找到'])[0])
+check('事件 A：卖出信号落在会后第 10 个交易日', evDetailA.includes('信号日 ' + dayAt(I_A + 10)))
+check('明细写明命中的是哪个真实事件',
+  evDetailA.includes('命中 ' + dayAt(I_A) + ' 2026年半年度业绩说明会'),
+  (evDetailA.match(/命中[^，。]{0,40}/) || ['未找到命中说明'])[0])
+check('事件条件被当作条件拆解（不是快照）',
+  evDetailA.includes('EVMEET(-1)') && evDetailA.includes('无法自动归因') === false)
+tRows()[1].props.onClick()
+tree = render()
+
+tRows()[0].props.onClick()
+tree = render()
+const evDetailB = collectText(tree)
+// 事件 B 的日期落在两根 K 线之间（周末）：必须顺延到之后第一个交易日，
+// 所以「会前一个交易日」是 I_B-1 —— 若错误地取前一根 K 线，这里会是 I_B-2。
+check('非交易日的会议顺延到之后第一个交易日', evDetailB.includes('信号日 ' + dayAt(I_B - 1)),
+  '期望 ' + dayAt(I_B - 1) + ' / 全文 ' + (evDetailB.match(/信号日 [\d-]+/) || ['未找到'])[0])
+tRows()[0].props.onClick()
+tree = render()
+
+// 3) 取不到事件数据时必须说清楚，而不是静默算成「没有信号」
+eventsAvailable = false
+hookState.length = 0
+hookIndex = 0
+tree = render()
+await tick(); await tick(); await tick(); await tick()
+tree = render()
+click('公司数据')
+check('事件取数失败时页面给出错误', collectText(tree).includes('事件日期加载失败'))
+click('策略配置')
+const evFail = await runBacktestNow()
+check('没有事件数据时策略给出可读错误',
+  evFail.includes('事件因子需要公司事件数据'),
+  (evFail.match(/JS 策略错误[^]{0,60}/) || ['无错误信息'])[0])
+eventsAvailable = true
 
 console.log('\n[6] 图标组件')
 const icon = iconReg.component({ size: 20, active: true })

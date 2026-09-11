@@ -89,6 +89,10 @@ window.__ModuleLoader__.load({
       '.astk-say{margin:6px 0 8px;padding:8px 10px;border-radius:6px;border-left:3px solid var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}',
       '.astk-say-h{font-size:11.5px;color:var(--dsw-alias-label-secondary);margin-bottom:3px}',
       '.astk-say-b{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-primary);white-space:pre-wrap}',
+      // 事件类型徽标：一眼分清说明会 / 财报 / 除权除息。
+      '.astk-evk{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11.5px;white-space:nowrap;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}',
+      '.astk-evk-meeting{color:var(--dsw-alias-brand-primary)}',
+      '.astk-evk-exdiv{color:var(--dsw-alias-label-primary)}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -385,6 +389,13 @@ window.__ModuleLoader__.load({
           else if (callName === 'ABS') out = A[0].map((v) => (v === null ? null : Math.abs(v)))
           else if (callName === 'MAX') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.max(v, A[1][i])))
           else if (callName === 'MIN') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.min(v, A[1][i])))
+          // ---- 事件因子：真实事件日期 + 交易日换算，全部来自公开数据 ----
+          else if (callName === 'EV' || callName === 'EVMEET' || callName === 'EVREP' || callName === 'EVDIV') {
+            if (!S.EV) throw new Error('事件因子需要公司事件数据（说明会 / 财报预约披露 / 除权除息），这只股票没取到，可到「公司数据」页确认')
+            if (node.args.length === 0) throw new Error(callName + ' 需要一个交易日偏移参数，例如 ' + callName + '(-1)')
+            const kind = callName === 'EV' ? 'all' : callName === 'EVMEET' ? 'meeting' : callName === 'EVREP' ? 'report' : 'exdiv'
+            out = eventFactor(S, callName, kind, constArg(A[0], callName))
+          }
           // ---- 市场情绪因子：全部由「个股 + 大盘指数」两组序列算出，完全可回测 ----
           else if (callName === 'RS' || callName === 'IDXRET' || callName === 'IDXMA' || callName === 'IDXVOL' || callName === 'IDXDEV' || callName === 'BETA') {
             const B = benchOrThrow()
@@ -434,14 +445,96 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 事件索引：把「事件日期」换算成「第几根 K 线」。
+     *
+     * 事件当天不是交易日时（公告常在周末或盘后发布）顺延到之后第一个交易日，
+     * 这样「前一个交易日」这种说法才有确定含义——而这件事**只能**按真实 K 线算，
+     * 让模型自己推日历日期必然是错的。
+     * @param bars - K 线数组。
+     * @param events - 宿主返回的真实事件列表。
+     * @returns { bars, byKind, cache }；没有可用事件时返回 null。
+     */
+    function buildEventIndex(bars, events) {
+      if (!Array.isArray(events) || events.length === 0 || !Array.isArray(bars) || bars.length === 0) return null
+      const iso = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v === null || v === undefined ? '' : v)) ? String(v) : null)
+      const byKind = { all: [], meeting: [], report: [], exdiv: [] }
+      for (const ev of events) {
+        const date = iso(ev && ev.date)
+        if (date === null) continue
+        let at = -1
+        for (let i = 0; i < bars.length; i++) if (String(bars[i][0]) >= date) { at = i; break }
+        if (at < 0) continue
+        const item = {
+          at, date, announcedAt: iso(ev.announcedAt), kind: String((ev && ev.kind) || ''),
+          // 标题要带进来：交易明细里得能说出「这次买卖对应的是哪一场说明会」。
+          title: String((ev && ev.title) || ''),
+        }
+        byKind.all.push(item)
+        if (byKind[item.kind] !== undefined) byKind[item.kind].push(item)
+      }
+      return byKind.all.length === 0 ? null : { bars, byKind, cache: {}, hits: {} }
+    }
+
+    /**
+     * 事件因子：相对事件第 n 个交易日为 1，其余为 0。
+     *
+     * 「提前于事件」的条件只在那一根 K 线当天事件**已经公告**时才允许触发，
+     * 否则就是拿着事后才知道的日期提前埋伏——那是未来函数。财报预约披露日与
+     * 事先公布的会议日期天然通过这一关；公告日本身则不可能被提前。
+     * @param S - seriesOf() 的结果（需带 EV 索引）。
+     * @param kind - all / meeting / report / exdiv。
+     * @param offset - 相对事件日的交易日偏移，可为负。
+     * @returns 0/1 序列。
+     */
+    function eventSeries(S, kind, offset) {
+      const key = kind + '|' + offset
+      const cached = S.EV.cache[key]
+      if (cached !== undefined) return cached
+      const out = new Array(S.n).fill(0)
+      const list = S.EV.byKind[kind] || []
+      const hits = []
+      for (const ev of list) {
+        const target = ev.at + offset
+        if (target < 0 || target >= S.n) continue
+        if (ev.announcedAt !== null && String(S.EV.bars[target][0]) < ev.announcedAt) continue
+        out[target] = 1
+        // 记住是哪一条事件命中的：交易明细里要能说出「这次买卖对应哪场说明会」。
+        hits.push({ target, date: ev.date, kind: ev.kind, title: ev.title || '' })
+      }
+      S.EV.hits[key] = hits
+      S.EV.cache[key] = out
+      return out
+    }
+
+    /**
+     * 事件因子 + 触发证据。
+     *
+     * 事件因子本身就是一个 1/0 条件序列，所以也给它打上条件标记：这样交易明细
+     * 里会显示「EVMEET(-1) ✓」，并写明这一根对应的是哪一场说明会——这是真实证据，
+     * 不是「系统猜的」。
+     */
+    function eventFactor(S, name, kind, offset) {
+      const out = eventSeries(S, kind, offset)
+      const text = name + '(' + offset + ')'
+      if (astkTraceOf(out) === null) {
+        astkMark(astkMark(out, ASTK_TRACE, {
+          kind: 'cmp', name, text, result: out, args: [],
+          hits: (S.EV.hits[kind + '|' + offset] || []).slice(0, 12),
+        }), ASTK_TEXT, text)
+      }
+      return out
+    }
+
+    /**
      * 把 K 线数组拆成各序列。
      * @param bars - [date, o, c, h, l, v] 的数组。
      * @param bench - 与 bars 按日期对齐的指数收盘价序列；为 null 时情绪因子不可用。
+     * @param events - 真实事件列表；为 null 时事件因子不可用。
      */
-    const seriesOf = (bars, bench) => {
+    const seriesOf = (bars, bench, events) => {
       const n = bars.length; const C = []; const O = []; const H = []; const L = []; const V = []
       for (let i = 0; i < n; i++) { const b = bars[i]; O.push(b[1]); C.push(b[2]); H.push(b[3]); L.push(b[4]); V.push(b[5]) }
-      return { n, C, O, H, L, V, BENCH: bench || null }
+      return { n, C, O, H, L, V, BENCH: bench || null, EV: buildEventIndex(bars, events) }
     }
 
     /**
@@ -690,15 +783,28 @@ window.__ModuleLoader__.load({
           }
           const a = node.args[0]
           const b = node.args[1]
-          // 交叉必须给出**前一根**：只看当根的值证明不了上穿/下穿。
-          let detail = '今 ' + num(valueAt(a))
-          if (b) {
-            detail += ' vs ' + num(valueAt(b))
-            if (node.name === 'CROSS' && i > 0) {
-              detail += '　／　前 ' + num(prevAt(a)) + ' vs ' + num(prevAt(b))
+          let detail
+          if (a === undefined) {
+            // 事件因子这类没有操作数的条件：证据就是「这一根对应哪个真实事件」。
+            detail = '今 ' + num(node.result ? node.result[i] : null)
+          } else {
+            // 交叉必须给出**前一根**：只看当根的值证明不了上穿/下穿。
+            detail = '今 ' + num(valueAt(a))
+            if (b) {
+              detail += ' vs ' + num(valueAt(b))
+              if (node.name === 'CROSS' && i > 0) {
+                detail += '　／　前 ' + num(prevAt(a)) + ' vs ' + num(prevAt(b))
+              }
             }
           }
-          rows.push({ depth, kind: 'cmp', pass, contrib, text: node.text, detail, note: node.note || '' })
+          let note = node.note || ''
+          if (Array.isArray(node.hits) && node.hits.length > 0) {
+            const matched = node.hits.filter((h) => h.target === i)
+            if (matched.length > 0) {
+              note = '命中 ' + matched.map((h) => h.date + ' ' + h.title).join('；')
+            }
+          }
+          rows.push({ depth, kind: 'cmp', pass, contrib, text: node.text, detail, note })
         }
         try { walk(top, 0, true) } catch { return null }
         return rows
@@ -789,6 +895,11 @@ window.__ModuleLoader__.load({
         IDXDEV: marketFn('IDXDEV'),
         IDXVOL: marketFn('IDXVOL'),
         BETA: marketFn('BETA'),
+        // 事件因子：相对真实事件（说明会 / 财报预约披露 / 除权除息）第 n 个交易日
+        EV: marketFn('EV'),
+        EVMEET: marketFn('EVMEET'),
+        EVREP: marketFn('EVREP'),
+        EVDIV: marketFn('EVDIV'),
       }
     }
 
@@ -798,6 +909,7 @@ window.__ModuleLoader__.load({
       'BOLL_UP', 'BOLL_MID', 'BOLL_LOW', 'CROSS', 'GT', 'LT', 'GTE', 'LTE', 'AND', 'OR', 'NOT',
       'ABS', 'MAX', 'MIN',
       'RS', 'IDXRET', 'IDXMA', 'IDXDEV', 'IDXVOL', 'BETA',
+      'EV', 'EVMEET', 'EVREP', 'EVDIV',
     ]
 
     /**
@@ -995,6 +1107,22 @@ window.__ModuleLoader__.load({
           'return {',
           '  buy: AND(AND(stockUp, marketUp), strong),',
           '  sell: OR(LT(C, MA(C, ' + p.n + ')), LT(BENCH, IDXMA(' + p.n + '))),',
+          '}',
+        ].join('\n'),
+      },
+      {
+        // 事件因子模板：日期来自真实公告，交易日换算由引擎按 K 线完成。
+        // 买 2 卖 -1 是「会前避险卖出、会后第二个交易日再买回」的常见打法。
+        id: 'ev', name: '说明会前后',
+        params: [['buyAt', '会后第几个交易日买入', 2], ['sellAt', '会前第几个交易日卖出', -1]],
+        buy: (p) => 'EVMEET(' + p.buyAt + ')',
+        sell: (p) => 'EVMEET(' + p.sellAt + ')',
+        js: (p) => [
+          '// 事件日期是真实的（来自交易所公告），「第几个交易日」由引擎按真实 K 线换算。',
+          '// 事件当天不是交易日时顺延到之后第一个交易日。',
+          'return {',
+          '  buy: EVMEET(' + p.buyAt + '),',
+          '  sell: EVMEET(' + p.sellAt + '),',
           '}',
         ].join('\n'),
       },
@@ -1198,6 +1326,7 @@ window.__ModuleLoader__.load({
         bars: [], seriesKey: '', barsLoading: false, barsError: '', source: '', indexBars: null,
         quote: null, quoteError: '',
         fins: [], finsError: '', finsLoading: false,
+        events: [], eventsError: '', eventsLoading: false, eventCounts: null,
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1297,9 +1426,29 @@ window.__ModuleLoader__.load({
           })
       }
 
+      /** 取该股的真实事件日期（说明会 / 财报预约披露 / 除权除息），供事件因子使用。 */
+      function loadEvents(code) {
+        store.set({ eventsLoading: true, eventsError: '' })
+        api('events', { code })
+          .then((res) => {
+            if (store.get().selected !== code) return
+            store.set({
+              events: Array.isArray(res.events) ? res.events : [],
+              eventCounts: res.counts || null, eventsLoading: false,
+            })
+          })
+          .catch((error) => {
+            if (store.get().selected !== code) return
+            store.set({ events: [], eventCounts: null, eventsLoading: false, eventsError: String((error && error.message) || error) })
+          })
+      }
+
       function select(code) {
-        store.set({ selected: code, quote: null, quoteError: '', fins: [], finsError: '', hover: null, offset: 0, bt: null })
-        loadQuote(code); loadFins(code); loadBars()
+        store.set({
+          selected: code, quote: null, quoteError: '', fins: [], finsError: '',
+          events: [], eventsError: '', eventCounts: null, hover: null, offset: 0, bt: null,
+        })
+        loadQuote(code); loadFins(code); loadEvents(code); loadBars()
       }
 
       function search(q) {
@@ -1380,15 +1529,21 @@ window.__ModuleLoader__.load({
             description,
             // 只在 JS 模式下把现有代码交给模型，让它在此基础上改。
             currentCode: s.strategyMode === 'js' ? s.jsSource : '',
+            // 把当前标的的真实事件日期一并交给模型：它自己算不出哪天开发布会、
+            // 更算不出哪天是交易日，不给真实日期它只能编。
+            code: s.selected || '',
+            name: (s.quote && s.quote.name) || '',
           })
           const code = String(res.code || '')
           if (code === '') throw new Error('模型没有返回代码')
           let note = '已由 ' + String(res.model || '模型') + ' 生成'
           if (res.usage && typeof res.usage.outputTokens === 'number') note += '（输出 ' + res.usage.outputTokens + ' tokens）'
+          if (res.events > 0) note += '，已把该股 ' + res.events + ' 条真实事件日期交给模型'
+          else if (s.selected) note += '，但没取到该股的事件日期（需要事件因子的策略可能不准）'
           try {
             const bars = store.get().bars
             if (bars && bars.length >= 30) {
-              runJsStrategy(code, seriesOf(bars))
+              runJsStrategy(code, seriesOf(bars, null, store.get().events))
               note += '，已通过试运行校验'
             }
           } catch (error) {
@@ -1458,7 +1613,7 @@ window.__ModuleLoader__.load({
         // JS 策略可选导出的 why(i, side)：由策略作者自己说明第 i 根 bar 为什么触发。
         let jsWhy = null
         try {
-          seriesSet = seriesOf(bars, bench)
+          seriesSet = seriesOf(bars, bench, s.events)
           if (s.strategyMode === 'js') {
             const signals = runJsStrategy(s.jsSource, seriesSet)
             buySeries = signals.buy
@@ -1854,6 +2009,37 @@ window.__ModuleLoader__.load({
             React.createElement('td', null, fmt(r.bps)),
             React.createElement('td', null, fmt(r.roe)),
             React.createElement('td', null, fmt(r.gross))))
+          // 公司动态：真实事件日期。策略里的 EVMEET(-1) 这类事件因子，靠的就是这张表。
+          const eventKind = { meeting: '说明会', report: '财报披露', exdiv: '除权除息' }
+          const eventRows = s.events.map((ev, i) => React.createElement('tr', { key: 'ev' + i, 'data-astk': 'event-row' },
+            React.createElement('td', { 'data-astk': 'event-date' }, ev.date),
+            React.createElement('td', null, React.createElement('span', { className: 'astk-evk astk-evk-' + ev.kind }, eventKind[ev.kind] || ev.kind)),
+            React.createElement('td', null, ev.title),
+            React.createElement('td', null, ev.announcedAt ? ev.announcedAt + ' 公告' : '事先已公开'),
+            React.createElement('td', null, ev.actual && ev.actual !== ev.date ? '实际 ' + ev.actual : '')))
+          const eventsSection = React.createElement('div', { className: 'astk-sec' },
+            React.createElement('h4', null, '公司动态（真实事件日期）'),
+            s.eventsLoading ? React.createElement('div', { className: 'astk-note' }, '加载事件日期中…') : null,
+            s.eventsError ? React.createElement('div', { className: 'astk-err' }, '事件日期加载失败：' + s.eventsError) : null,
+            s.events.length > 0
+              ? React.createElement('table', { className: 'astk-tab', 'data-astk': 'event-table' },
+                  React.createElement('thead', null, React.createElement('tr', null,
+                    React.createElement('th', null, '日期'),
+                    React.createElement('th', null, '类型'),
+                    React.createElement('th', null, '内容'),
+                    React.createElement('th', null, '何时公开'),
+                    React.createElement('th', null, '备注'))),
+                  React.createElement('tbody', null, eventRows))
+              : (s.eventsLoading || s.eventsError ? null
+                : React.createElement('div', { className: 'astk-note' },
+                    '没有取到事件日期。港股公告的数据源与 A 股不同，目前可能为空。')),
+            React.createElement('div', { className: 'astk-note' },
+              '事件日期来自交易所公告与预约披露时间表，都是**事先公开**过的日期，所以可以安全地用在回测里。'
+              + '策略里用 EV(n) / EVMEET(n) / EVREP(n) / EVDIV(n) 引用：n 是相对该事件的第 n 个交易日，'
+              + 'n = -1 表示事件前一个交易日，n = 2 表示事件后第二个交易日；「哪天是交易日」由引擎按真实 K 线换算，不需要你算日历。'),
+            React.createElement('div', { className: 'astk-note' },
+              '「财报披露」用的是**预约披露日**而不是实际披露日：预约时间表是交易所期初公布的，用它做「财报前卖出」是合规的；'
+              + '用实际披露日等于提前知道了财报哪天出。除权除息日与会议日期同样都有公告日在前。'))
           content = React.createElement('div', null,
             s.finsLoading ? React.createElement('div', { className: 'astk-note' }, '加载财务数据中…') : null,
             s.finsError ? React.createElement('div', { className: 'astk-err' }, '财务数据加载失败：' + s.finsError) : null,
@@ -1866,7 +2052,8 @@ window.__ModuleLoader__.load({
                     React.createElement('th', null, 'ROE(%)'),
                     React.createElement('th', null, '毛利率(%)'))),
                   React.createElement('tbody', null, rows))
-              : (s.finsLoading ? null : React.createElement('div', { className: 'astk-note' }, '暂无财务数据。')))
+              : (s.finsLoading ? null : React.createElement('div', { className: 'astk-note' }, '暂无财务数据。')),
+            eventsSection)
         } else if (s.tab === 'strategy') {
           const tpl = templateById(s.templateId)
           // 当前标的所属市场 —— 决定 T+1/T+0、涨跌停、费率与每手股数。
@@ -1878,7 +2065,7 @@ window.__ModuleLoader__.load({
             const bench = alignCloses(s.bars, s.indexBars)
             if (bench === null) return null
             try {
-              const S = seriesOf(s.bars, bench)
+              const S = seriesOf(s.bars, bench, s.events)
               const latest = (expr) => {
                 const series = evalAst(parseSource(expr), S)
                 for (let i = series.length - 1; i >= 0; i--) {
@@ -1943,7 +2130,9 @@ window.__ModuleLoader__.load({
                 }),
                 React.createElement('div', { className: 'astk-note' },
                   '可用（都是与 K 线等长的数组，索引可直接用）：C O H L V；MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)；RSI(n) DIF() DEA() MACD() BOLL_UP(p,k) BOLL_MID(p) BOLL_LOW(p,k)；CROSS(a,b) GT LT GTE LTE AND OR NOT；ABS/MAX/MIN。'
-                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH 指数序列、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'),
+                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH 指数序列、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'
+                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息；'
+                + 'n 是相对该事件的第 n 个交易日（-1 = 前一交易日，2 = 后第二个交易日），交易日换算按真实 K 线，不用你自己算日期。'),
                 React.createElement('div', { className: 'astk-note' },
                   '必须 return { buy, sell }，两个数组长度都要等于 C.length。可以写任意 JS：循环、变量、多条件分支、自定义中间量。'),
                 React.createElement('div', { className: 'astk-note' },
@@ -1968,7 +2157,9 @@ window.__ModuleLoader__.load({
                 }),
                 React.createElement('div', { className: 'astk-note' },
                   '可用：C O H L V（收/开/高/低/量）、MA(n) EMA(n) SUM(n) STD(n)、RSI(n)、DIF() DEA() MACD()、BOLL_UP(n,k) BOLL_MID(n) BOLL_LOW(n,k)、HHV(n) LLV(n) REF(x,n) CROSS(a,b)、ABS/MAX/MIN，以及 + - * / > < >= <= == != AND OR NOT 与括号。'
-                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH（指数序列）、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'),
+                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH（指数序列）、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'
+                + ' 事件因子（真实日期，见「公司数据」页）：EV(n) 全部事件、EVMEET(n) 说明会/股东大会、EVREP(n) 财报预约披露、EVDIV(n) 除权除息；'
+                + 'n 是相对该事件的第 n 个交易日（-1 = 前一交易日，2 = 后第二个交易日）。'),
                 React.createElement('div', { className: 'astk-note' },
                   '说明：信号在收盘产生、次日开盘成交（无未来函数）；买入当日不可卖出（T+1）。需要循环或多分支时切到 JavaScript 模式。'))
 
@@ -2013,7 +2204,7 @@ window.__ModuleLoader__.load({
             React.createElement('textarea', {
               className: 'astk-ta', rows: 3, value: s.aiDescription,
               'data-astk': 'ai-description',
-              placeholder: '例如：20 日均线上穿 60 日均线时买入，跌破 20 日均线时卖出，成交量低于 20 日均量时不做买入。',
+              placeholder: '例如：20 日均线上穿 60 日均线时买入，跌破 20 日均线时卖出。\n也可以写事件类需求：公司开业绩说明会的前一个交易日卖出，会后的第二个交易日买入。',
               onChange: (e) => store.set({ aiDescription: e.target.value }),
             }),
             React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
