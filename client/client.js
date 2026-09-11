@@ -82,6 +82,13 @@ window.__ModuleLoader__.load({
       '.astk-cond-m{width:12px;flex:0 0 auto}',
       '.astk-cond-t{color:var(--dsw-alias-label-primary)}',
       '.astk-cond-v{color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}',
+      // 实际触发项加重显示：一眼看出这次买卖到底踩中了哪一条。
+      '.astk-cond-hit .astk-cond-t{font-weight:700}',
+      '.astk-cond-hit .astk-cond-v{color:var(--dsw-alias-label-primary)}',
+      '.astk-cond-logic .astk-cond-t{color:var(--dsw-alias-label-secondary)}',
+      '.astk-say{margin:6px 0 8px;padding:8px 10px;border-radius:6px;border-left:3px solid var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}',
+      '.astk-say-h{font-size:11.5px;color:var(--dsw-alias-label-secondary);margin-bottom:3px}',
+      '.astk-say-b{font-size:12.5px;line-height:1.6;color:var(--dsw-alias-label-primary);white-space:pre-wrap}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -561,7 +568,10 @@ window.__ModuleLoader__.load({
         const raw = i >= 0 && i < e.pass.length ? e.pass[i] : null
         const out = { text: e.text, pass: raw === null || raw === undefined ? null : Boolean(raw) }
         if (e.kind === 'cmp' && e.left !== null && e.right !== null && i >= 0) {
-          out.detail = num(e.left[i]) + '  vs  ' + num(e.right[i])
+          // 必须同时给出**前一根**：判断「上穿 / 下穿 / 突破」这类条件，
+          // 只看当根的值证明不了任何事——交叉需要两根才能成立。
+          out.detail = '今 ' + num(e.left[i]) + ' vs ' + num(e.right[i])
+          if (i > 0) out.detail += '　／　前 ' + num(e.left[i - 1]) + ' vs ' + num(e.right[i - 1])
         }
         return out
       })
@@ -581,7 +591,118 @@ window.__ModuleLoader__.load({
       return (i) => items.map((it) => ({
         text: it.text,
         value: i >= 0 && i < it.series.length ? it.series[i] : null,
+        // 带上前一根：交叉、突破、转折这类判断只看当根是看不出来的。
+        prev: i > 0 && i - 1 < it.series.length ? it.series[i - 1] : null,
       }))
+    }
+
+    // ---------------- JS 策略的触发链路追踪 ----------------
+    //
+    // JS 策略没法靠读源码归因——它有循环和状态机。但它在**计算层面**是收敛的：
+    // 每个条件都是策略库里 GT / LT / CROSS / AND / OR 这些函数的组合。所以只要
+    // 每个函数返回时把自己的身份、操作数、结果记下来，信号日就能反过来把整条
+    // 「哪条条件成立、每条的操作数各是多少」还原出来——这是真实证据，不是猜的。
+
+    /** 结果数组上的两个隐藏标记（不可枚举，JSON / for...of / map 都看不到）。 */
+    const ASTK_TRACE = '__astkTrace'
+    const ASTK_TEXT = '__astkText'
+
+    /** 给结果数组打标记；数组被冻结时安静放弃，追踪失败不影响策略本身。 */
+    function astkMark(arr, key, value) {
+      if (Array.isArray(arr)) {
+        try { Object.defineProperty(arr, key, { value, enumerable: false, configurable: true }) } catch { /* 冻结数组：放弃追踪 */ }
+      }
+      return arr
+    }
+    /** 取节点标记；不是库函数算出来的序列就返回 null（无法继续往下拆）。 */
+    const astkTraceOf = (v) => (Array.isArray(v) && v[ASTK_TRACE] ? v[ASTK_TRACE] : null)
+    /** 操作数的可读文本。 */
+    const astkTextOf = (v) => {
+      if (typeof v === 'number') return String(v)
+      if (v === null || v === undefined) return '—'
+      if (Array.isArray(v)) {
+        const tr = v[ASTK_TRACE]
+        return v[ASTK_TEXT] || (tr ? tr.text : '序列')
+      }
+      return String(v)
+    }
+    /** 把操作数连同「它在哪根 bar 上取值」一起记下来，供信号日取证据。 */
+    const astkOperand = (v) => ({
+      text: astkTextOf(v),
+      arr: Array.isArray(v) ? v : null,
+      num: typeof v === 'number' ? v : null,
+    })
+
+    /**
+     * 为一个已追踪的信号序列构造解释器。
+     *
+     * 返回的行是**扁平**的（带 depth），和表达式模式的条件列表同构，UI 只需一套渲染：
+     *   - kind 'logic'：AND / OR / NOT 节点，说明它是「全部成立」还是「任一成立」；
+     *   - kind 'cmp'  ：真正可验证的比较 / 交叉条件，带当根（交叉还带前一根）的数值。
+     * `contrib` 表示这一条是否真的参与了本次信号（OR 分支里没成立的那些就是 false），
+     * UI 据此把「实际触发项」加重显示——这正是用户要的「基于哪个点」。
+     *
+     * @param root - JS 策略返回的 buy / sell 数组。
+     * @returns 传入 bar 索引返回行数组；该序列没有追踪信息时返回 null。
+     */
+    function buildTraceExplainer(root) {
+      const top = astkTraceOf(root)
+      if (top === null) return null
+      return (i) => {
+        if (i < 0 || i >= root.length) return null
+        const rows = []
+        const truth = (v) => v !== null && v !== undefined && Boolean(v)
+        const valueAt = (op) => (op.arr !== null ? (i < op.arr.length ? op.arr[i] : null) : op.num)
+        const prevAt = (op) => (op.arr !== null ? (i > 0 ? op.arr[i - 1] : null) : op.num)
+        const walk = (node, depth, contrib) => {
+          const pass = node.result && i < node.result.length ? truth(node.result[i]) : null
+          if (node.kind === 'logic') {
+            const kids = node.args || []
+            const kidPass = kids.map((k) => truth(valueAt(k)))
+            const isOr = node.name === 'OR'
+            const isNot = node.name === 'NOT'
+            rows.push({
+              depth,
+              kind: 'logic',
+              pass,
+              contrib,
+              text: isOr ? '任一条件成立（OR）' : isNot ? '取反（NOT）' : '全部条件成立（AND）',
+              detail: '',
+              note: isOr
+                ? '下面 ' + kidPass.filter(Boolean).length + ' 条成立，本次信号由它们触发'
+                : isNot ? '被取反的条件取值如下' : '下列条件必须同时成立',
+            })
+            for (let j = 0; j < kids.length; j++) {
+              const child = astkTraceOf(kids[j].arr)
+              // OR：只有成立的子条件才算触发源；AND：每个子条件都是触发源；
+              // NOT：子条件的真假与整体相反，所以子条件本身不加重——加重的是
+              // 「取反（NOT）」这一行，子条件只作为取值证据列出。
+              const nextContrib = isNot ? false : (isOr ? contrib && kidPass[j] : contrib)
+              if (child !== null) walk(child, depth + 1, nextContrib)
+              else {
+                rows.push({
+                  depth: depth + 1, kind: 'cmp', pass: kidPass[j], contrib: nextContrib,
+                  text: kids[j].text, detail: '今 ' + num(valueAt(kids[j])), note: '',
+                })
+              }
+            }
+            return
+          }
+          const a = node.args[0]
+          const b = node.args[1]
+          // 交叉必须给出**前一根**：只看当根的值证明不了上穿/下穿。
+          let detail = '今 ' + num(valueAt(a))
+          if (b) {
+            detail += ' vs ' + num(valueAt(b))
+            if (node.name === 'CROSS' && i > 0) {
+              detail += '　／　前 ' + num(prevAt(a)) + ' vs ' + num(prevAt(b))
+            }
+          }
+          rows.push({ depth, kind: 'cmp', pass, contrib, text: node.text, detail, note: node.note || '' })
+        }
+        try { walk(top, 0, true) } catch { return null }
+        return rows
+      }
     }
 
     // ---------------- JavaScript 策略 ----------------
@@ -603,15 +724,38 @@ window.__ModuleLoader__.load({
     function buildJsLib(S) {
       const call = (name, args) => evalAst({ k: 'call', name, args: args.map(jsNode) }, S)
       const bin = (op, a, b) => evalAst({ k: 'bin', op, a: jsNode(a), b: jsNode(b) }, S)
+      // 基础序列先起名，操作数文本才写得成人话（C / V / BENCH 而不是「序列」）。
+      astkMark(S.C, ASTK_TEXT, 'C'); astkMark(S.O, ASTK_TEXT, 'O')
+      astkMark(S.H, ASTK_TEXT, 'H'); astkMark(S.L, ASTK_TEXT, 'L')
+      astkMark(S.V, ASTK_TEXT, 'V')
+      if (S.BENCH) astkMark(S.BENCH, ASTK_TEXT, 'BENCH')
+      // 指标结果只起名、**不打条件标记**：它是「值」不是「条件」，否则会被当成
+      // 一条永远成立/不成立的条件混进证据里。
+      const named = (text, arr) => astkMark(arr, ASTK_TEXT, text)
+      /** 比较/交叉：结果本身就是「这条成立吗」，是证据链的叶子。 */
+      const compare = (name, text, a, b, arr) => astkMark(astkMark(arr, ASTK_TRACE, {
+        kind: 'cmp', name, text, result: arr, args: [astkOperand(a), astkOperand(b)],
+      }), ASTK_TEXT, text)
+      /** 逻辑合成：证据链的中间节点，展示时继续往下拆。 */
+      const logic = (name, text, kids, arr) => astkMark(astkMark(arr, ASTK_TRACE, {
+        kind: 'logic', name, text, result: arr, args: kids.map(astkOperand),
+      }), ASTK_TEXT, text)
       // 双参形式 MA(x, n)；省略序列时用默认序列（HHV 用最高价、LLV 用最低价）。
-      const seriesFn = (name, fallback) => (a, b) => (
-        typeof a === 'number' || a === undefined ? call(name, [fallback, a === undefined ? b : a]) : call(name, [a, b])
-      )
+      const seriesFn = (name, fallback) => (a, b) => {
+        const def = typeof a === 'number' || a === undefined
+        const src = def ? fallback : a
+        const p = def ? (a === undefined ? b : a) : b
+        return named(name + '(' + astkTextOf(src) + ', ' + p + ')', call(name, [src, p]))
+      }
       // BOLL 在求值器里只吃 (周期, 倍数)，但允许用户写成 BOLL_UP(C, 20, 2)，多余序列忽略。
       const bollFn = (name) => (...args) => {
         const nums = args.filter((v) => typeof v === 'number')
-        return call(name, [nums[0] === undefined ? 20 : nums[0], nums[1] === undefined ? 2 : nums[1]])
+        const p = nums[0] === undefined ? 20 : nums[0]
+        const k = nums[1] === undefined ? 2 : nums[1]
+        return named(name + '(' + p + ', ' + k + ')', call(name, [p, k]))
       }
+      const unaryFn = (name) => (x) => named(name + '(' + astkTextOf(x) + ')', call(name, [x]))
+      const marketFn = (name) => (p) => named(name + '(' + p + ')', call(name, [p]))
       return {
         MA: seriesFn('MA', S.C),
         EMA: seriesFn('EMA', S.C),
@@ -619,32 +763,32 @@ window.__ModuleLoader__.load({
         STD: seriesFn('STD', S.C),
         HHV: seriesFn('HHV', S.H),
         LLV: seriesFn('LLV', S.L),
-        REF: (x, p) => call('REF', [x, p]),
-        RSI: (p) => call('RSI', [p === undefined ? 14 : p]),
-        DIF: () => call('DIF', []),
-        DEA: () => call('DEA', []),
-        MACD: () => call('MACD', []),
+        REF: (x, p) => named('REF(' + astkTextOf(x) + ', ' + p + ')', call('REF', [x, p])),
+        RSI: (p) => named('RSI(' + (p === undefined ? 14 : p) + ')', call('RSI', [p === undefined ? 14 : p])),
+        DIF: () => named('DIF()', call('DIF', [])),
+        DEA: () => named('DEA()', call('DEA', [])),
+        MACD: () => named('MACD()', call('MACD', [])),
         BOLL_UP: bollFn('BOLL_UP'),
         BOLL_MID: bollFn('BOLL_MID'),
         BOLL_LOW: bollFn('BOLL_LOW'),
-        CROSS: (a, b) => call('CROSS', [a, b]),
-        ABS: (x) => call('ABS', [x]),
-        MAX: (a, b) => call('MAX', [a, b]),
-        MIN: (a, b) => call('MIN', [a, b]),
-        GT: (a, b) => bin('>', a, b),
-        LT: (a, b) => bin('<', a, b),
-        GTE: (a, b) => bin('>=', a, b),
-        LTE: (a, b) => bin('<=', a, b),
-        AND: (a, b) => bin('&&', a, b),
-        OR: (a, b) => bin('||', a, b),
-        NOT: (a) => evalAst({ k: 'not', a: jsNode(a) }, S),
+        CROSS: (a, b) => compare('CROSS', 'CROSS(' + astkTextOf(a) + ', ' + astkTextOf(b) + ')', a, b, call('CROSS', [a, b])),
+        ABS: unaryFn('ABS'),
+        MAX: (a, b) => named('MAX(' + astkTextOf(a) + ', ' + astkTextOf(b) + ')', call('MAX', [a, b])),
+        MIN: (a, b) => named('MIN(' + astkTextOf(a) + ', ' + astkTextOf(b) + ')', call('MIN', [a, b])),
+        GT: (a, b) => compare('GT', astkTextOf(a) + ' > ' + astkTextOf(b), a, b, bin('>', a, b)),
+        LT: (a, b) => compare('LT', astkTextOf(a) + ' < ' + astkTextOf(b), a, b, bin('<', a, b)),
+        GTE: (a, b) => compare('GTE', astkTextOf(a) + ' >= ' + astkTextOf(b), a, b, bin('>=', a, b)),
+        LTE: (a, b) => compare('LTE', astkTextOf(a) + ' <= ' + astkTextOf(b), a, b, bin('<=', a, b)),
+        AND: (a, b) => logic('AND', astkTextOf(a) + ' 且 ' + astkTextOf(b), [a, b], bin('&&', a, b)),
+        OR: (a, b) => logic('OR', astkTextOf(a) + ' 或 ' + astkTextOf(b), [a, b], bin('||', a, b)),
+        NOT: (a) => logic('NOT', '非(' + astkTextOf(a) + ')', [a], evalAst({ k: 'not', a: jsNode(a) }, S)),
         // 市场情绪因子（都返回与 K 线等长的序列）
-        RS: (n) => call('RS', [n]),
-        IDXRET: (n) => call('IDXRET', [n]),
-        IDXMA: (n) => call('IDXMA', [n]),
-        IDXDEV: (n) => call('IDXDEV', [n]),
-        IDXVOL: (n) => call('IDXVOL', [n]),
-        BETA: (n) => call('BETA', [n]),
+        RS: marketFn('RS'),
+        IDXRET: marketFn('IDXRET'),
+        IDXMA: marketFn('IDXMA'),
+        IDXDEV: marketFn('IDXDEV'),
+        IDXVOL: marketFn('IDXVOL'),
+        BETA: marketFn('BETA'),
       }
     }
 
@@ -689,11 +833,28 @@ window.__ModuleLoader__.load({
       if (out.buy.length !== S.n || out.sell.length !== S.n) {
         throw new Error('信号数组长度必须等于 K 线根数 ' + S.n + '，实际 buy=' + out.buy.length + '、sell=' + out.sell.length)
       }
-      return { buy: out.buy, sell: out.sell }
+      // 可选的 why(i, side) 钩子：JS 代码的触发原因只有写代码的人说得准，
+      // 系统无法可靠归因。与其编一个像原因的理由，不如让策略自己讲。
+      const why = typeof out.why === 'function' ? out.why : null
+      return { buy: out.buy, sell: out.sell, why }
     }
 
-    /** 新建 JS 策略时的默认内容，兼作可运行的示例。 */
-    const DEFAULT_JS = [
+    /**
+     * 回测明细里「一键改写」用的指令。
+     *
+     * 只在策略**无法自动归因**时出现：改写要求保持买卖逻辑不变，只把条件换成
+     * 条件函数组合并补上 why 说明，这样明细里就既有执行证据、又有作者的话。
+     */
+    const REWRITE_ASK = [
+      '请改写下面这段策略，买卖逻辑必须完全不变，只做两件事：',
+      '1. 把所有买卖条件改成用 GT / LT / GTE / LTE / CROSS / AND / OR / NOT 组合表达，',
+      '   不要出现 C[i] > MA(C, 20)[i] 这类原生比较（系统要按条件函数自动给出触发证据）；',
+      '2. 在 return 里加上 why(i, side) 函数，用中文说明第 i 根 K 线为什么买或为什么卖，',
+      '   要点明用到的是哪几个具体条件与其取值，不要写「符合策略」这类空话。',
+      '原来的循环、变量与持仓状态逻辑原样保留。',
+    ].join('\n')
+
+    /** 新建 JS 策略时的默认内容，兼作可运行的示例。 */    const DEFAULT_JS = [
       '// 写你的策略。可用（返回序列数组，索引与 K 线对齐）：',
       '//   C O H L V      收盘/开盘/最高/最低/成交量',
       '//   MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)',
@@ -705,16 +866,24 @@ window.__ModuleLoader__.load({
       '//   IDXRET(n)      指数 n 日涨幅    IDXMA(n) 指数均线    IDXDEV(n) 指数偏离均线',
       '//   IDXVOL(n)      指数年化波动率  BETA(n)  个股对指数的滚动 Beta',
       '// 必须 return { buy, sell }，两个数组长度都要等于 C.length。',
+      '// 触发证据：用 GT/LT/GTE/LTE/CROSS/AND/OR/NOT 组合条件，交易明细里就能自动',
+      '// 拆出信号日每一条的真假与两边数值，并标出本次实际触发的是哪几条。',
       '// 例：大盘在均线上方、且个股跑赢大盘时才买。',
       'const marketUp = GT(BENCH, IDXMA(60))',
       'const strong = GT(RS(20), 1)',
       'const volUp = GT(V, MA(V, 20))',
       'const fast = MA(C, 5)',
       'const slow = MA(C, 20)',
-      'return {',
-      '  buy: AND(AND(CROSS(fast, slow), volUp), AND(marketUp, strong)),',
-      '  sell: OR(CROSS(slow, fast), LT(C, slow)),',
+      'const goldenCross = CROSS(fast, slow)',
+      'const buy = AND(AND(goldenCross, volUp), AND(marketUp, strong))',
+      'const sell = OR(CROSS(slow, fast), LT(C, slow))',
+      '// 可选：自己说明某一天为什么买卖。返回的这句话会显示在交易明细最前面，',
+      '// 后面紧跟系统自动拆解出的条件证据。不想写就删掉 why 这一行。',
+      'function why(i, side) {',
+      '  if (side === "buy") return "5 日线上穿 20 日线，成交量高过 20 日均量，且大盘在 60 日线上方、个股跑赢沪深300"',
+      '  return "5 日线下穿 20 日线，或收盘跌破 20 日线"',
       '}',
+      'return { buy, sell, why }',
     ].join('\n')
 
     // ---------------- 策略模板 ----------------
@@ -1036,6 +1205,8 @@ window.__ModuleLoader__.load({
         buyExpr: firstTpl.buy(defaultParams(firstTpl)), sellExpr: firstTpl.sell(defaultParams(firstTpl)),
         jsSource: DEFAULT_JS,
         aiDescription: '', aiBusy: false, aiError: '', aiNote: '',
+        // AI 改写前的代码留一份，用户在策略页可以一键换回来。
+        jsSourcePrev: '',
         disclaimer: null, disclaimerBusy: false,
         capital: 1000000, commission: 0.00025, stampTax: 0.0005, stampTaxBuy: 0, transferFee: 0.00001, slippage: 0.001,
         btFrom: yearsAgoISO(DEFAULT_BT_YEARS), btTo: '',
@@ -1194,14 +1365,16 @@ window.__ModuleLoader__.load({
        * 都能当场暴露，而不是等用户点了回测才发现。试运行失败也会把代码填进去，
        * 方便用户看见并手动修。
        */
-      async function generateWithAi() {
+      async function generateWithAi(override) {
         const s = store.get()
-        const description = s.aiDescription.trim()
+        const isRewrite = typeof override === 'string' && override !== ''
+        const description = isRewrite ? override : s.aiDescription.trim()
         if (description === '') {
           store.set({ aiError: '先用一句话描述你想要的策略，例如「20 日均线上穿 60 日均线买入，跌破 20 日线卖出」', aiNote: '' })
           return
         }
-        store.set({ aiBusy: true, aiError: '', aiNote: '' })
+        // 从回测明细点「一键改写」时，跳到策略页让用户看着它发生（成功失败都在那里显示）。
+        store.set(isRewrite ? { aiBusy: true, aiError: '', aiNote: '', tab: 'strategy' } : { aiBusy: true, aiError: '', aiNote: '' })
         try {
           const res = await apiPost('generate-strategy', {
             description,
@@ -1221,7 +1394,7 @@ window.__ModuleLoader__.load({
           } catch (error) {
             note += '；但试运行报错：' + String((error && error.message) || error)
           }
-          store.set({ jsSource: code, strategyMode: 'js', aiBusy: false, aiNote: note, aiError: '' })
+          store.set({ jsSource: code, jsSourcePrev: s.jsSource, strategyMode: 'js', aiBusy: false, aiNote: note, aiError: '' })
         } catch (error) {
           store.set({ aiBusy: false, aiNote: '', aiError: '生成失败：' + String((error && error.message) || error) })
         }
@@ -1282,12 +1455,15 @@ window.__ModuleLoader__.load({
         let buySeries = null
         let sellSeries = null
         let seriesSet = null
+        // JS 策略可选导出的 why(i, side)：由策略作者自己说明第 i 根 bar 为什么触发。
+        let jsWhy = null
         try {
           seriesSet = seriesOf(bars, bench)
           if (s.strategyMode === 'js') {
             const signals = runJsStrategy(s.jsSource, seriesSet)
             buySeries = signals.buy
             sellSeries = signals.sell
+            jsWhy = signals.why
           } else {
             buySeries = evalAst(parseSource(s.buyExpr), seriesSet)
             sellSeries = evalAst(parseSource(s.sellExpr), seriesSet)
@@ -1298,14 +1474,20 @@ window.__ModuleLoader__.load({
           return
         }
 
-        // 交易解释：表达式模式逐条件拆解；JS 模式只能给指标快照。
+        // 交易解释：表达式模式逐条件拆解；JS 模式优先用策略库留下的触发链路
+        // （哪条条件成立、操作数各是多少），拆不出来——作者写的是原生 JS 比较——
+        // 才退回指标快照，并在 UI 里如实说明「无法自动归因」以及怎么才能拿到证据。
         // 构造失败不影响回测本身，只是明细里没有「为什么」。
+        const jsMode = s.strategyMode === 'js'
         let explainBuy = null
         let explainSell = null
         let snapshot = null
         try {
-          if (s.strategyMode === 'js') snapshot = buildSnapshot(seriesSet)
-          else {
+          if (jsMode) {
+            explainBuy = buildTraceExplainer(buySeries)
+            explainSell = buildTraceExplainer(sellSeries)
+            snapshot = buildSnapshot(seriesSet)
+          } else {
             explainBuy = buildExplainer(parseSource(s.buyExpr), seriesSet)
             explainSell = buildExplainer(parseSource(s.sellExpr), seriesSet)
           }
@@ -1343,7 +1525,20 @@ window.__ModuleLoader__.load({
           hints.push('起始日 ' + from + ' 早于已加载的最早数据 ' + allBars[0][0] + '，该段未参与回测；需要更早数据请到「K线」页把年数调大。')
         }
         // 给每笔交易附上买入/卖出信号日的「为什么」证据。
-        const whyKind = s.strategyMode === 'js' ? 'snapshot' : 'conditions'
+        const whyKindOf = (explain) => (
+          explain !== null ? (jsMode ? 'trace' : 'conditions') : (snapshot !== null ? 'snapshot' : 'none')
+        )
+        const buyKind = whyKindOf(explainBuy)
+        const sellKind = whyKindOf(explainSell)
+        const whyKind = buyKind === 'trace' || sellKind === 'trace' ? 'trace' : (jsMode ? 'snapshot' : 'conditions')
+        // JS 策略可以自己讲原因：why(i, side) 返回一句人话。用户钩子抛错不影响回测。
+        const askWhy = (index, side) => {
+          if (jsWhy === null) return null
+          try {
+            const text = jsWhy(index, side)
+            return typeof text === 'string' && text.trim() !== '' ? text.trim() : null
+          } catch { return null }
+        }
         const trades = result.trades.map((t) => Object.assign({}, t, {
           bSignalDate: bars[t.bSignal] ? bars[t.bSignal][0] : null,
           sSignalDate: bars[t.sSignal] ? bars[t.sSignal][0] : null,
@@ -1351,6 +1546,10 @@ window.__ModuleLoader__.load({
             : (snapshot !== null ? snapshot(t.bSignal) : null),
           sellWhy: explainSell !== null ? explainSell(t.sSignal)
             : (snapshot !== null ? snapshot(t.sSignal) : null),
+          buyKind,
+          sellKind,
+          buyReason: askWhy(t.bSignal, 'buy'),
+          sellReason: askWhy(t.sSignal, 'sell'),
         }))
         const payload = {
           metrics, equity: result.equity, trades,
@@ -1747,6 +1946,11 @@ window.__ModuleLoader__.load({
                 + ' 市场情绪因子（依赖沪深300，可回测）：BENCH 指数序列、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'),
                 React.createElement('div', { className: 'astk-note' },
                   '必须 return { buy, sell }，两个数组长度都要等于 C.length。可以写任意 JS：循环、变量、多条件分支、自定义中间量。'),
+                React.createElement('div', { className: 'astk-note' },
+                  '触发证据：用 GT / LT / GTE / LTE / CROSS / AND / OR / NOT 组合出来的条件，系统能在交易明细里自动拆出「信号日每一条成立还是不成立、两边数值各是多少」，并标出本次实际触发的是哪几条。'
+                  + '如果直接写 C[i] > MA(C, 20)[i] 这种原生比较，系统读不出是哪一句成立的，只能给指标快照。'
+                  + '还可以在 return 里加 why(i, side) 函数自己说明原因（返回一句话，会显示在交易明细最前面）：' 
+                  + 'return { buy, sell, why: (i, side) => side === "buy" ? "5 日线上穿 20 日线且放量" : "跌破 20 日线止损" }。'),
                 React.createElement('div', { className: 'astk-warn' },
                   '注意：代码在你的浏览器里执行。请避免死循环（如 while(true)）——主线程被占满会让界面卡住，刷新页面即可恢复。'))
             : React.createElement('div', { className: 'astk-sec' },
@@ -1824,6 +2028,16 @@ window.__ModuleLoader__.load({
                   : '生成后会切到 JavaScript 模式并填入代码。')),
             s.aiNote ? React.createElement('div', { className: 'astk-note' }, '✓ ' + s.aiNote) : null,
             s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null,
+            s.jsSourcePrev
+              ? React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
+                  React.createElement('button', {
+                    className: 'astk-btn',
+                    'data-astk': 'js-restore',
+                    onClick: () => store.set({ jsSource: s.jsSourcePrev, jsSourcePrev: s.jsSource }),
+                  }, '↺ 换回改写前的代码'),
+                  React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
+                    'AI 改写会覆盖文本框里的内容，旧代码留在这里随时可换回来。'))
+              : null,
             React.createElement('div', { className: 'astk-note' },
               'AI 生成的策略代码仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'))
 
@@ -1898,30 +2112,73 @@ window.__ModuleLoader__.load({
             const legend = React.createElement('div', { className: 'astk-legend' },
               React.createElement('span', { style: { color: 'var(--dsw-alias-brand-primary)' } }, '— 策略'),
               bt.bench ? React.createElement('span', null, '— 沪深300基准') : React.createElement('span', null, '（基准数据不可用）'))
-            // 交易行可点击，向下展开「为什么买 / 为什么卖」的证据。
-            const whyBlock = (title, signalDate, tradeDate, price, why, kind) => React.createElement('div', { className: 'astk-why' },
-              React.createElement('div', { className: 'astk-why-head' }, title),
-              React.createElement('div', { className: 'astk-note' },
-                '信号日 ' + (signalDate || '—') + '（收盘） → 成交日 ' + (tradeDate || '—') + '（开盘 @' + fmt(price) + '）'),
-              kind === 'snapshot'
-                ? React.createElement('div', { className: 'astk-note' },
-                    '该策略是 JavaScript 代码（可能含循环与状态机），无法自动定位到具体是哪一句触发的。以下是信号日的指标快照，供你对照代码自行核对：')
-                : React.createElement('div', { className: 'astk-note' }, '信号日各条件的取值：'),
-              why === null || why.length === 0
-                ? React.createElement('div', { className: 'astk-note' }, '（未生成解释）')
-                : React.createElement('div', null, why.map((c, i) => {
-                  if (kind === 'snapshot') {
-                    return React.createElement('div', { key: 'c' + i, className: 'astk-cond' },
-                      React.createElement('span', { className: 'astk-cond-t' }, c.text),
-                      React.createElement('span', { className: 'astk-cond-v' }, num(c.value)))
-                  }
-                  const mark = c.error ? '⚠' : c.pass === true ? '✓' : c.pass === false ? '✗' : '·'
-                  return React.createElement('div', { key: 'c' + i, className: 'astk-cond' },
-                    React.createElement('span', { className: 'astk-cond-m ' + (c.pass === true ? 'astk-up' : c.pass === false ? 'astk-down' : 'astk-flat') }, mark),
-                    React.createElement('span', { className: 'astk-cond-t' }, c.text),
-                    c.detail ? React.createElement('span', { className: 'astk-cond-v' }, c.detail) : null,
-                    c.error ? React.createElement('span', { className: 'astk-cond-v' }, '无法求值') : null)
-                })))
+            // 交易行可点击，向下展开「为什么买 / 为什么卖」的完整证据链。
+            const whyRow = (c, i, kind) => {
+              if (kind === 'snapshot') {
+                const detail = '今 ' + num(c.value) + (c.prev === null || c.prev === undefined ? '' : '　／　前 ' + num(c.prev))
+                return React.createElement('div', { key: 'c' + i, className: 'astk-cond' },
+                  React.createElement('span', { className: 'astk-cond-t' }, c.text),
+                  React.createElement('span', { className: 'astk-cond-v' }, detail))
+              }
+              const mark = c.error ? '⚠' : c.pass === true ? '✓' : c.pass === false ? '✗' : '·'
+              const cls = c.error ? 'astk-flat' : c.pass === true ? 'astk-up' : c.pass === false ? 'astk-down' : 'astk-flat'
+              return React.createElement('div', {
+                key: 'c' + i,
+                className: 'astk-cond' + (c.contrib ? ' astk-cond-hit' : '') + (c.kind === 'logic' ? ' astk-cond-logic' : ''),
+                style: c.depth ? { paddingLeft: (c.depth * 16) + 'px' } : null,
+              },
+              React.createElement('span', { className: 'astk-cond-m ' + cls }, mark),
+              React.createElement('span', { className: 'astk-cond-t' }, c.text),
+              c.detail ? React.createElement('span', { className: 'astk-cond-v' }, c.detail) : null,
+              c.note ? React.createElement('span', { className: 'astk-cond-v' }, c.note) : null,
+              c.error ? React.createElement('span', { className: 'astk-cond-v' }, '无法求值') : null)
+            }
+
+            const whyBlock = (title, signalDate, tradeDate, price, why, kind, reason) => {
+              const head = [
+                React.createElement('div', { className: 'astk-why-head', key: 'h' }, title),
+                React.createElement('div', { className: 'astk-note', key: 'd' },
+                  '信号日 ' + (signalDate || '—') + '（收盘决定信号） → 成交日 ' + (tradeDate || '—') + '（开盘 @' + fmt(price) + '）'),
+              ]
+              // 1) 策略自己讲的原因——只有写代码的人说得准，所以放在最前面。
+              if (reason) {
+                head.push(React.createElement('div', { className: 'astk-say', key: 'say' },
+                  React.createElement('div', { className: 'astk-say-h' }, '策略自述原因（why 钩子返回）'),
+                  React.createElement('div', { className: 'astk-say-b' }, reason)))
+              }
+              // 2) 系统自动拆解的证据链。
+              if (kind === 'conditions') {
+                head.push(React.createElement('div', { className: 'astk-note', key: 'n' },
+                  '信号日逐条条件的取值（✓ 成立、✗ 不成立；右侧是当天的实际数值）：'))
+              } else if (kind === 'trace') {
+                head.push(React.createElement('div', { className: 'astk-note', key: 'n' },
+                  '按你代码里的条件函数自动拆解（✓ 成立、✗ 不成立；加重显示的是本次信号的实际触发项，缩进表示条件之间的嵌套关系）：'))
+              } else if (kind === 'snapshot') {
+                head.push(React.createElement('div', { className: 'astk-warn', key: 'n' },
+                  '无法自动归因：这段 JS 策略没有用策略库的条件函数（GT / LT / GTE / LTE / CROSS / AND / OR / NOT）组合条件，'
+                  + '系统读不出是哪一句成立的。下面只是信号日的指标快照，供你对照代码自行核对，它**不是**触发原因。'))
+                head.push(React.createElement('div', { className: 'astk-note', key: 'n2' },
+                  '想让它自动给出证据，三选一：① 让 AI 一键改写（保持买卖逻辑不变，改成条件函数 + why 说明）；'
+                  + '② 自己把条件写成条件函数的形式，例如 GTE(RSI(14), 50) 表示「RSI 不低于 50」，'
+                  + '系统会自动列出每条条件的真假与数值；③ 在代码最后的 return 里加上 why(i, side) 函数，自己说明第 i 根 K 线为什么买卖，'
+                  + '返回值会显示在这里。'))
+                if (s.strategyMode === 'js') {
+                  head.push(React.createElement('div', { key: 'fix', style: { marginTop: '8px' } },
+                    React.createElement('button', {
+                      className: 'astk-btn astk-btn-on',
+                      'data-astk': 'why-rewrite',
+                      disabled: s.aiBusy,
+                      onClick: () => { void generateWithAi(REWRITE_ASK) },
+                    }, s.aiBusy ? '改写中…' : '一键让 AI 改写成可归因版本')))
+                }
+              } else if (kind === 'none') {
+                head.push(React.createElement('div', { className: 'astk-note', key: 'n' }, '（未生成解释）'))
+              }
+              if (why !== null && why.length > 0) {
+                head.push(React.createElement('div', { key: 'rows' }, why.map((c, i) => whyRow(c, i, kind))))
+              }
+              return React.createElement('div', { className: 'astk-why' }, head)
+            }
 
             const tradeRows = []
             bt.trades.slice().reverse().slice(0, 200).forEach((t, idx) => {
@@ -1940,8 +2197,8 @@ window.__ModuleLoader__.load({
               if (open) {
                 tradeRows.push(React.createElement('tr', { key: 'd' + idx, className: 'astk-trow-detail' },
                   React.createElement('td', { colSpan: 6 },
-                    whyBlock('为什么买', t.bSignalDate, t.bd, t.bp, t.buyWhy, bt.whyKind),
-                    whyBlock('为什么卖', t.sSignalDate, t.sd, t.sp, t.sellWhy, bt.whyKind))))
+                    whyBlock('为什么买', t.bSignalDate, t.bd, t.bp, t.buyWhy, t.buyKind || bt.whyKind, t.buyReason),
+                    whyBlock('为什么卖', t.sSignalDate, t.sd, t.sp, t.sellWhy, t.sellKind || bt.whyKind, t.sellReason))))
               }
             })
             content = React.createElement('div', null,

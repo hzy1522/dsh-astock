@@ -193,6 +193,10 @@ console.log('\n[9] AI 生成策略（mock llm）')
   check('system 提示包含返回契约', typeof sent.system === 'string' && sent.system.includes('return { buy, sell }'))
   check('system 提示列出了可用函数', sent.system.includes('CROSS(a, b)') && sent.system.includes('BOLL_UP'))
   check('system 提示声明了分工', sent.system.includes('不要自己模拟资金'))
+  // 交易明细要能自动拆出触发条件，前提是生成的代码用条件函数组合、并带 why 钩子。
+  check('system 提示禁止原生比较', sent.system.includes('禁止直接写 C[i] > MA(C, 20)[i]'))
+  check('system 提示要求 why 钩子', sent.system.includes('function why(i, side)'))
+  check('system 提示要求 why 说清具体条件', sent.system.includes('不要写「符合策略」这类空话'))
   check('messages 结构正确', Array.isArray(sent.messages) && sent.messages.length === 1
     && sent.messages[0].role === 'user' && sent.messages[0].content[0].type === 'text'
     && sent.messages[0].source.kind === 'plugin' && sent.messages[0].source.plugin === 'astock')

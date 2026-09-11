@@ -111,9 +111,12 @@ const makeDisclaimer = (accepted) => ({
   acceptedAt: accepted ? '2026-09-11T00:00:00.000Z' : null,
 })
 const fetchCalls = []
+// 记录 POST body：验证「一键改写」确实把当前策略代码和改写指令发给了宿主。
+const fetchBodies = []
 globalThis.fetch = async (url, init) => {
   const raw = String(url)
   fetchCalls.push(raw)
+  if (init !== undefined && init.body !== undefined) fetchBodies.push(String(init.body))
   const [path, search] = raw.split('?')
   const key = path.replace('/astock/api/', '')
   if (key === 'generate-strategy') {
@@ -725,21 +728,117 @@ tRows()[0].props.onClick()
 tree = render()
 check('再次点击收起明细', collect(tree).every((n) => String(classNameOf(n)).split(' ')[0] !== 'astk-trow-detail'))
 
-// ---- JS 模式：无法定位语句，必须如实说明并给快照 ----
+// ---- JS 模式（条件函数组合）：必须自动拆出「哪条条件成立、两边数值多少」 ----
 useJs([
   'const fast = MA(C, 5)',
   'const slow = MA(C, 20)',
-  'return { buy: CROSS(fast, slow), sell: CROSS(slow, fast) }',
+  'const volUp = GT(V, MA(V, 20))',
+  '// 恒假条件：必须被如实列成 ✗，用来说明系统没有编造原因',
+  'const never = GT(RSI(14), 200)',
+  'const notDumping = NOT(LT(C, MA(C, 20)))',
+  'const buy = AND(AND(CROSS(fast, slow), volUp), notDumping)',
+  'const sell = OR(CROSS(slow, fast), never)',
+  'function why(i, side) {',
+  '  return side === "buy" ? "第 " + i + " 根：5 日线上穿 20 日线且放量" : "5 日线下穿 20 日线"',
+  '}',
+  'return { buy, sell, why }',
 ].join('\n'))
 const jsWhyRun = await runBacktestNow()
 check('JS 策略产生了交易', /(\d+)交易次数/.test(jsWhyRun), (jsWhyRun.match(/\d+交易次数/) || ['未渲染'])[0])
 tRows()[0].props.onClick()
 tree = render()
 const jsDetail = collectText(tree)
-check('JS 模式如实说明无法定位触发语句', jsDetail.includes('无法自动定位到具体是哪一句'))
-check('JS 模式改为给出指标快照', jsDetail.includes('指标快照'))
-check('快照里含常用指标', jsDetail.includes('MA(5)') && jsDetail.includes('RSI(14)') && jsDetail.includes('MACD()'))
-check('JS 模式不假装是条件拆解', jsDetail.includes('条件拆解') === false)
+check('JS 模式不再只说「无法定位」', jsDetail.includes('无法自动归因') === false)
+check('JS 模式拆出了具体条件', jsDetail.includes('CROSS(MA(C, 5), MA(C, 20))'), (jsDetail.match(/CROSS\([^)]*\)[^ ]*/) || ['未找到'])[0])
+check('JS 模式给条件配了数值证据', /今 [\d.]+ vs [\d.]+/.test(jsDetail), (jsDetail.match(/今 [\d.]+ vs [\d.]+/) || ['未找到'])[0])
+check('交叉条件同时给出前一根', jsDetail.includes('／　前 '), (jsDetail.match(/前 [\d.]+ vs [\d.]+/) || ['未找到'])[0])
+check('AND 逻辑节点被标出', jsDetail.includes('全部条件成立（AND）'))
+check('OR 逻辑节点被标出', jsDetail.includes('任一条件成立（OR）'))
+check('NOT 逻辑节点被标出', jsDetail.includes('取反（NOT）') && jsDetail.includes('C < MA(C, 20)'))
+check('恒假条件被如实列成不成立', jsDetail.includes('RSI(14) > 200'))
+check('why 钩子的自述原因被展示在明细里',
+  jsDetail.includes('策略自述原因') && jsDetail.includes('5 日线上穿 20 日线且放量'))
+const hitRows = collect(tree).filter((n) => String(classNameOf(n)).includes('astk-cond-hit'))
+check('标出了本次实际触发项', hitRows.length > 0, hitRows.length + ' 条加重显示')
+check('触发项里没有不成立的条件',
+  hitRows.every((n) => collectText(n).includes('✓') || collectText(n).includes('·')),
+  hitRows.map((n) => collectText(n).slice(0, 24)).join(' | '))
+// OR 分支里恒假的那条不能算触发源——这正是「基于哪个点」的关键
+check('OR 里没成立的分支不算触发源',
+  hitRows.every((n) => collectText(n).includes('RSI(14) > 200') === false),
+  hitRows.map((n) => collectText(n).slice(0, 20)).join(' | '))
+
+// ---- 原生比较：拆不出来时必须如实说明，并给出两条可操作的出路 ----
+const rawStrategy = [
+  'const fast = MA(C, 5)',
+  'const slow = MA(C, 20)',
+  '// 故意用原生比较：系统拿不到条件函数留下的标记，只能给快照',
+  'const buy = [], sell = []',
+  'buy.push(0); sell.push(0)',
+  'for (let i = 1; i < C.length; i++) {',
+  '  buy.push(C[i] > slow[i] ? 1 : 0)',
+  '  sell.push(C[i] < slow[i] ? 1 : 0)',
+  '}',
+  'return { buy, sell }',
+].join('\n')
+useJs(rawStrategy)
+const rawRun = await runBacktestNow()
+check('原生 JS 策略也能跑', /(\d+)交易次数/.test(rawRun), (rawRun.match(/\d+交易次数/) || ['未渲染'])[0])
+tRows()[0].props.onClick()
+tree = render()
+const rawDetail = collectText(tree)
+check('原生比较时如实说明无法自动归因', rawDetail.includes('无法自动归因'))
+check('给出了两条出路（条件函数 / why 钩子）',
+  rawDetail.includes('why(i, side)') && rawDetail.includes('GT / LT / GTE / LTE / CROSS'))
+check('兜底仍给出指标快照', rawDetail.includes('指标快照') && rawDetail.includes('MACD()'))
+check('兜底不假装自己是条件拆解',
+  rawDetail.includes('全部条件成立') === false && rawDetail.includes('CROSS(MA(C, 5), MA(C, 20))') === false)
+
+// ---- 一键改写：把「不可归因」的代码交给 AI 改成带证据的版本，且旧代码可换回 ----
+const rawSource = rawStrategy
+// 前面的用例把生成结果改成了语法错的半截代码，这里换回一段真实可归因的策略。
+generateFixture = {
+  code: [
+    'const fast = MA(C, 10)',
+    'const slow = MA(C, 30)',
+    'const never = GT(RSI(14), 200)',
+    'const buy = CROSS(fast, slow)',
+    'const sell = OR(CROSS(slow, fast), never)',
+    'const why = (i, side) => side === "buy" ? "10 日线上穿 30 日线" : "10 日线下穿 30 日线"',
+    'return { buy, sell, why }',
+  ].join('\n'),
+  provider: 'stub', model: 'stub-model', usage: { outputTokens: 55 },
+}
+const rewriteBtn = collect(tree).find((n) => n.props['data-astk'] === 'why-rewrite')
+check('兜底里给出一键改写按钮', rewriteBtn !== undefined)
+rewriteBtn.props.onClick()
+tree = render()
+await tick(); await tick(); await tick()
+tree = render()
+const rewriteReq = fetchBodies.map((b) => { try { return JSON.parse(b) } catch { return {} } })
+  .find((b) => String(b.description || '').includes('买卖逻辑必须完全不变'))
+check('改写请求带上了当前策略代码', rewriteReq !== undefined && rewriteReq.currentCode === rawSource)
+check('改写指令要求用条件函数组合', String(rewriteReq.description).includes('原生比较'))
+check('改写指令要求补 why 钩子', String(rewriteReq.description).includes('why(i, side)'))
+check('改写后的代码进了编辑器', jsEditorValue() === generateFixture.code, jsEditorValue().slice(0, 40))
+check('改写后自动切到策略页', byData('ai-description') !== undefined)
+
+// 改写的意义就在这里：同一份逻辑，改写后明细里立刻有了执行证据。
+const rewrittenRun = await runBacktestNow()
+check('改写后的策略能跑通', /(\d+)交易次数/.test(rewrittenRun), (rewrittenRun.match(/\d+交易次数/) || ['未渲染'])[0])
+tRows()[0].props.onClick()
+tree = render()
+const rewrittenDetail = collectText(tree)
+check('改写后明细自动拆出了条件', rewrittenDetail.includes('CROSS(MA(C, 10), MA(C, 30))'))
+check('改写后明细不再说「无法自动归因」', rewrittenDetail.includes('无法自动归因') === false)
+check('改写后 why 自述也一并展示', rewrittenDetail.includes('10 日线上穿 30 日线'))
+
+click('策略配置')
+const restoreBtn = collect(tree).find((n) => n.props['data-astk'] === 'js-restore')
+check('提供换回改写前代码的入口', restoreBtn !== undefined)
+restoreBtn.props.onClick()
+tree = render()
+check('换回后编辑器内容是原策略', jsEditorValue() === rawSource, jsEditorValue().slice(0, 40))
 
 console.log('\n[6] 图标组件')
 const icon = iconReg.component({ size: 20, active: true })
