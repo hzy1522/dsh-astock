@@ -679,6 +679,68 @@ check('指数不可用时给出可读错误',
   (noIndex.match(/JS 策略错误[^]{0,70}/) || ['无错误信息'])[0])
 indexAvailable = true
 
+console.log('\n[5h] 交易明细：为什么买 / 为什么卖')
+
+// 用一条「金叉 OR 恒假条件」的策略：交易照常发生，同时能验证界面会如实
+// 展示**不成立**的条件，而不是只把成立的那条挑出来说。
+click('策略配置')
+if (byData('buy-expr') === undefined) {
+  findButton(tree, '表达式').props.onClick()
+  tree = render()
+}
+setField('buy-expr', 'CROSS(MA(5),MA(20)) OR RSI(14)<0')
+setField('sell-expr', 'CROSS(MA(20),MA(5)) OR RSI(14)>100')
+const whyRun = await runBacktestNow()
+const whyTrades = (whyRun.match(/(\d+)交易次数/) || [])[1]
+check('该策略产生了交易', whyTrades !== undefined && Number(whyTrades) > 0, whyTrades + ' 笔')
+
+const tRows = () => collect(tree).filter((n) => String(classNameOf(n)).split(' ')[0] === 'astk-trow')
+check('交易行存在', tRows().length > 0, tRows().length + ' 行')
+check('展开前没有明细行', collect(tree).every((n) => String(classNameOf(n)).split(' ')[0] !== 'astk-trow-detail'))
+
+const firstRow = tRows()[0]
+check('交易行可点击', typeof firstRow.props.onClick === 'function')
+firstRow.props.onClick()
+tree = render()
+
+const detailText = collectText(tree)
+check('点击后展开明细', collect(tree).some((n) => String(classNameOf(n)).split(' ')[0] === 'astk-trow-detail'))
+check('明细里分列了买卖两段原因', detailText.includes('为什么买') && detailText.includes('为什么卖'))
+check('写明了信号日与成交日的关系',
+  detailText.includes('信号日') && detailText.includes('收盘') && detailText.includes('开盘'),
+  (detailText.match(/信号日[^（]*（收盘） → 成交日[^（]*（开盘[^）]*）/) || ['未找到'])[0])
+
+// 关键：必须把表达式**拆成一条条条件**，并给出可核对的数值
+check('买入条件被拆解出来', detailText.includes('CROSS(MA(5), MA(20))'))
+check('不成立的条件也被如实列出', detailText.includes('RSI(14) < 0'), '')
+check('买卖两侧的条件都在', detailText.includes('CROSS(MA(20), MA(5))') && detailText.includes('RSI(14) > 100'))
+const conds = collect(tree).filter((n) => String(classNameOf(n)).split(' ')[0] === 'astk-cond')
+check('逐条件渲染成行', conds.length >= 4, conds.length + ' 条条件行')
+check('给出了比较两侧的具体数值', detailText.includes('vs'), (detailText.match(/[\d.]+ {2}vs {2}[\d.]+/) || ['未找到数值证据'])[0])
+const marks = collect(tree).filter((n) => String(classNameOf(n)).includes('astk-cond-m')).map((n) => collectText(n))
+check('条件带成立/不成立标记', marks.includes('✓') && marks.includes('✗'), JSON.stringify(marks))
+
+// 再点一次应收回
+tRows()[0].props.onClick()
+tree = render()
+check('再次点击收起明细', collect(tree).every((n) => String(classNameOf(n)).split(' ')[0] !== 'astk-trow-detail'))
+
+// ---- JS 模式：无法定位语句，必须如实说明并给快照 ----
+useJs([
+  'const fast = MA(C, 5)',
+  'const slow = MA(C, 20)',
+  'return { buy: CROSS(fast, slow), sell: CROSS(slow, fast) }',
+].join('\n'))
+const jsWhyRun = await runBacktestNow()
+check('JS 策略产生了交易', /(\d+)交易次数/.test(jsWhyRun), (jsWhyRun.match(/\d+交易次数/) || ['未渲染'])[0])
+tRows()[0].props.onClick()
+tree = render()
+const jsDetail = collectText(tree)
+check('JS 模式如实说明无法定位触发语句', jsDetail.includes('无法自动定位到具体是哪一句'))
+check('JS 模式改为给出指标快照', jsDetail.includes('指标快照'))
+check('快照里含常用指标', jsDetail.includes('MA(5)') && jsDetail.includes('RSI(14)') && jsDetail.includes('MACD()'))
+check('JS 模式不假装是条件拆解', jsDetail.includes('条件拆解') === false)
+
 console.log('\n[6] 图标组件')
 const icon = iconReg.component({ size: 20, active: true })
 check('图标返回 svg', icon.type === 'svg' && icon.props.width === 20)
