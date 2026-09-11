@@ -381,7 +381,7 @@ check('表达式模式回测出结果', exprTotal !== null && !exprRun.includes(
 
 // —— 切到 JS 模式 ——
 click('策略配置')
-findButton(tree, 'JavaScript').props.onClick()
+byData('mode-js').props.onClick()
 tree = render()
 check('切到 JS 模式后出现代码编辑器', jsEditorValue().includes('return {'))
 check('JS 模式默认示例可运行', jsEditorValue().includes('const fast = MA(C, 5)'), jsEditorValue().split('\n')[0])
@@ -445,20 +445,20 @@ await expectError('throw new Error("boom")', '运行时异常有提示', '运行
 console.log('\n[5c] AI 生成策略')
 
 click('策略配置')
-check('策略页：有 AI 生成入口', findButton(tree, 'AI 生成代码') !== undefined && byData('ai-description') !== undefined)
+check('策略页：有多轮对话入口', findButton(tree, '发送') !== undefined && byData('ai-description') !== undefined)
 
 // 未填描述就点生成：给提示，且不应发请求
 const callsBefore = fetchCalls.length
-findButton(tree, 'AI 生成代码').props.onClick()
+findButton(tree, '发送') !== undefined ? findButton(tree, '发送').props.onClick() : findButton(tree, '继续追问').props.onClick()
 tree = render()
 await tick()
 tree = render()
-check('未填描述时给出提示', collectText(tree).includes('先用一句话描述'))
+check('未填描述时给出提示', collectText(tree).includes('先用一句话说明'))
 check('未填描述时不请求模型', fetchCalls.length === callsBefore, '新增 ' + (fetchCalls.length - callsBefore) + ' 次请求')
 
 // 正常生成
 setField('ai-description', '10 日均线上穿 30 日均线买入，下穿卖出')
-findButton(tree, 'AI 生成代码').props.onClick()
+findButton(tree, '发送') !== undefined ? findButton(tree, '发送').props.onClick() : findButton(tree, '继续追问').props.onClick()
 tree = render()
 await tick(); await tick(); await tick()
 tree = render()
@@ -471,8 +471,9 @@ check('提示说明把真实事件日期交给了模型', aiText.includes('已�
 check('生成后立即试运行校验通过', aiText.includes('已通过试运行校验'))
 
 // 生成结果语法有错：仍填入便于手改，但提示试运行失败
+setField('ai-description', '再改一版')
 generateFixture = { code: 'const a = ', provider: 'stub', model: 'stub-model', usage: { outputTokens: 3 } }
-findButton(tree, 'AI 生成代码').props.onClick()
+findButton(tree, '发送') !== undefined ? findButton(tree, '发送').props.onClick() : findButton(tree, '继续追问').props.onClick()
 tree = render()
 await tick(); await tick(); await tick()
 tree = render()
@@ -481,6 +482,7 @@ check('有问题的代码仍填入编辑器', jsEditorValue() === 'const a = ')
 
 // 联网查到的候选事件：必须由用户确认后才成为自定义事件
 customEvents = []
+setField('ai-description', '发布会前一天卖出，会后第二天买入')
 generateFixture = {
   code: 'const sell = EVCUS(-1)\nconst buy = EVCUS(2)\nreturn { buy, sell }',
   provider: 'stub', model: 'stub-model', usage: { outputTokens: 60 },
@@ -490,7 +492,7 @@ generateFixture = {
     { date: '2026-09-20', title: '投资者交流会', announcedAt: null, source: 'https://example.com/ir', evidence: '' },
   ],
 }
-findButton(tree, 'AI 生成代码').props.onClick()
+findButton(tree, '发送') !== undefined ? findButton(tree, '发送').props.onClick() : findButton(tree, '继续追问').props.onClick()
 tree = render()
 await tick(); await tick(); await tick()
 tree = render()
@@ -517,15 +519,123 @@ check('确认后给出反馈', collectText(tree).includes('已把 3 个日期加
 check('试运行把候选事件算进去了', collectText(tree).includes('已按「交易所事件 + 待确认候选事件」试运行通过'),
   (collectText(tree).match(/已按[^；]*试运行通过/) || ['未找到'])[0])
 
-// 接口失败：显示可读错误
+// 接口失败：显示可读错误（对话里出现一条失败气泡，输入框内容不丢）
 generateError = '模型调用失败：配额不足'
-findButton(tree, 'AI 生成代码').props.onClick()
+setField('ai-description', '再来一版')
+findButton(tree, '继续追问').props.onClick()
 tree = render()
 await tick(); await tick(); await tick()
 tree = render()
 check('接口失败时显示可读错误', collectText(tree).includes('配额不足'), (collectText(tree).match(/生成失败：\S+/) || [''])[0])
+check('失败也在对话里留痕', collect(tree).some((n) => String(n.props.className || '').includes('astk-msg-err')))
+check('失败后输入框内容不丢', byData('ai-description').props.value === '再来一版', byData('ai-description').props.value)
 generateError = null
 
+console.log('\n[5c2] 多轮对话 + 表达式模式')
+{
+  const lastGenerate = () => fetchBodies.map((b) => { try { return JSON.parse(b) } catch { return {} } })
+    .filter((b) => typeof b.description === 'string').pop()
+  const send = (text) => {
+    if (byData('ai-description') === undefined) click('策略配置')
+    setField('ai-description', text)
+    const btn = findButton(tree, '发送') || findButton(tree, '继续追问')
+    btn.props.onClick()
+    tree = render()
+  }
+
+  // 清空对话重来，避免上一节的上下文干扰
+  click('策略配置')
+  if (collect(tree).some((n) => n.props['data-astk'] === 'chat-reset')) {
+    collect(tree).find((n) => n.props['data-astk'] === 'chat-reset').props.onClick()
+    tree = render()
+  }
+  check('清空后回到初始提示', collectText(tree).includes('一直追问下去'))
+
+  // 第二轮：必须把上一轮的对话一起带上（否则模型不知道上下文）
+  generateFixture = {
+    code: 'const fast = MA(C, 5)\nreturn { buy: GT(C, fast), sell: LT(C, fast) }',
+    provider: 'stub', model: 'stub-model', reply: '先用 5 日线做一版。', usage: { outputTokens: 20 },
+  }
+  send('写一个收盘价上穿 5 日线买入的策略')
+  await tick(); await tick()
+  tree = render()
+  const firstReq = lastGenerate()
+  check('第一轮不带历史', Array.isArray(firstReq.history) && firstReq.history.length === 0, JSON.stringify(firstReq.history))
+  check('第一轮带上当前模式', firstReq.mode === 'js' || firstReq.mode === 'expr', String(firstReq.mode))
+  check('AI 说明出现在气泡里', collectText(tree).includes('先用 5 日线做一版'))
+  const bubbles = (role) => collect(tree).filter((n) => n.props['data-astk'] === 'chat-' + role).length
+  check('对话里有一条用户消息与一条 AI 消息', bubbles('user') === 1 && bubbles('assistant') === 1,
+    'user=' + bubbles('user') + ' assistant=' + bubbles('assistant'))
+
+  generateFixture = {
+    code: 'const fast = MA(C, 5)\nconst volUp = GT(V, MA(V, 20))\nreturn { buy: AND(GT(C, fast), volUp), sell: LT(C, fast) }',
+    provider: 'stub', model: 'stub-model', reply: '加上了放量过滤。', usage: { outputTokens: 30 },
+  }
+  send('再加一个放量过滤')
+  await tick(); await tick()
+  tree = render()
+  const secondReq = lastGenerate()
+  check('第二轮把上一轮对话带上', Array.isArray(secondReq.history) && secondReq.history.length === 2,
+    JSON.stringify((secondReq.history || []).map((h) => h.role)))
+  check('历史里保留了上一轮的角色顺序',
+    secondReq.history[0].role === 'user' && secondReq.history[1].role === 'assistant',
+    JSON.stringify((secondReq.history || []).map((h) => h.role)))
+  check('历史里带着上一轮产出的策略', String(secondReq.history[1].text).includes('MA(C, 5)'),
+    String(secondReq.history[1].text).slice(0, 40))
+  check('第二轮的新代码已应用', jsEditorValue().includes('volUp'), jsEditorValue().split('\n')[1])
+  check('两轮都在对话里', collectText(tree).includes('写一个收盘价上穿 5 日线买入的策略') && collectText(tree).includes('再加一个放量过滤'))
+
+  // 切到表达式模式：AI 必须输出表达式，并填进买入/卖出条件
+  byData('mode-expr').props.onClick()
+  tree = render()
+  generateFixture = {
+    mode: 'expr', expr: { buy: 'CROSS(MA(5),MA(20)) AND V>MA(V,20)', sell: 'C<MA(20)' },
+    provider: 'stub', model: 'stub-model', reply: '改成金叉且放量买入。', usage: { outputTokens: 25 },
+  }
+  send('改成金叉且放量')
+  await tick(); await tick()
+  tree = render()
+  check('表达式模式会要求表达式', lastGenerate().mode === 'expr', String(lastGenerate().mode))
+  check('表达式填进了买入条件', byData('buy-expr').props.value === 'CROSS(MA(5),MA(20)) AND V>MA(V,20)', byData('buy-expr').props.value)
+  check('表达式填进了卖出条件', byData('sell-expr').props.value === 'C<MA(20)', byData('sell-expr').props.value)
+  check('说明里写明已更新为表达式并试运行通过', collectText(tree).includes('已更新为表达式策略，已通过试运行校验'),
+    (collectText(tree).match(/已更新为表达式策略[^\n]{0,20}/) || ['未找到'])[0])
+  const exprRestore = collect(tree).find((n) => n.props['data-astk'] === 'expr-restore')
+  check('提供换回上一版表达式的入口', exprRestore !== undefined)
+
+  // 表达式写错时要如实报错，而不是假装通过
+  generateFixture = {
+    mode: 'expr', expr: { buy: 'CROSS(MA(5)', sell: 'C<MA(20)' },
+    provider: 'stub', model: 'stub-model', reply: '再改一版。', usage: { outputTokens: 12 },
+  }
+  send('改一下')
+  await tick(); await tick()
+  tree = render()
+  check('表达式有语法错时如实报告试运行失败', collectText(tree).includes('试运行报错'),
+    (collectText(tree).match(/试运行报错：\S+/) || ['未找到'])[0])
+
+  // 换回上一版表达式
+  collect(tree).find((n) => n.props['data-astk'] === 'expr-restore').props.onClick()
+  tree = render()
+  check('换回后是上一版表达式', byData('buy-expr').props.value === 'CROSS(MA(5),MA(20)) AND V>MA(V,20)',
+    byData('buy-expr').props.value)
+
+  // 模型只是反问：不改编辑器，气泡里显示问题
+  generateFixture = { mode: '', plain: true, reply: '你想用几分钟均线？要不要加成交量过滤？', provider: 'stub', model: 'stub-model' }
+  const buyBefore = byData('buy-expr').props.value
+  send('你觉得呢')
+  await tick(); await tick()
+  tree = render()
+  check('反问式回答显示在气泡里', collectText(tree).includes('你想用几分钟均线'))
+  check('反问时不改动编辑器', byData('buy-expr').props.value === buyBefore, byData('buy-expr').props.value)
+  check('反问时标明本轮未改动策略', collectText(tree).includes('本轮只回答，未改动策略'))
+
+  // 清空对话
+  collect(tree).find((n) => n.props['data-astk'] === 'chat-reset').props.onClick()
+  tree = render()
+  check('清空对话后气泡消失',
+    collect(tree).every((n) => n.props['data-astk'] !== 'chat-user' && n.props['data-astk'] !== 'chat-assistant'))
+}
 console.log('\n[5d] 港股')
 
 // 侧栏点击切到港股（汇丰控股，每手 400 股）
@@ -601,7 +711,7 @@ check('明确写出无涨跌停', ruleText.includes('无涨跌停'))
 // 资金买不起 1 手（400 × 163 ≈ 65200）：应 0 交易并说清原因
 // 注意：[5c] 故意留下了一段写坏的 JS，这里先切回表达式模式拿一个可用策略。
 click('策略配置')
-findButton(tree, '表达式').props.onClick()
+byData('mode-expr').props.onClick()
 tree = render()
 setNumber('capital', 30000)
 const poor = await runBacktestNow()
@@ -793,7 +903,7 @@ check('IDXDEV(60) 与手算一致',
 const useJs = (code) => {
   click('策略配置')
   if (byData('js-source') === undefined) {
-    findButton(tree, 'JavaScript').props.onClick()
+    byData('mode-js').props.onClick()
     tree = render()
   }
   setField('js-source', code)
@@ -835,7 +945,7 @@ console.log('\n[5h] 交易明细：为什么买 / 为什么卖')
 // 展示**不成立**的条件，而不是只把成立的那条挑出来说。
 click('策略配置')
 if (byData('buy-expr') === undefined) {
-  findButton(tree, '表达式').props.onClick()
+  byData('mode-expr').props.onClick()
   tree = render()
 }
 setField('buy-expr', 'CROSS(MA(5),MA(20)) OR RSI(14)<0')
@@ -1085,6 +1195,23 @@ check('自定义事件的买入信号落在事件前一交易日',
 check('明细写明命中的自定义事件',
   evcusDetail.includes('命中 ' + dayAt(BAR_N - 140) + ' AI 查到的产品发布会'),
   (evcusDetail.match(/命中[^，。]{0,40}/) || ['未找到命中说明'])[0])
+
+// 2c) 表达式模式也要能用事件因子（含负数参数）——AI 在表达式模式下会这么输出
+click('策略配置')
+byData('mode-expr').props.onClick()
+tree = render()
+setField('buy-expr', 'EVCUS(-1)')
+setField('sell-expr', 'EVCUS(2)')
+const exprEvRun = await runBacktestNow()
+check('表达式模式的事件因子能跑通', !exprEvRun.includes('错误'), (exprEvRun.match(/表达式错误[^]{0,50}/) || [''])[0])
+check('表达式模式的事件因子产生了交易', Number(tradesOf(exprEvRun)) >= 1, tradesOf(exprEvRun) + ' 笔')
+tRows()[0].props.onClick()
+tree = render()
+check('表达式模式同样写明命中的事件',
+  collectText(tree).includes('命中 ' + dayAt(BAR_N - 140) + ' AI 查到的产品发布会'),
+  (collectText(tree).match(/命中[^，。]{0,40}/) || ['未找到命中说明'])[0])
+tRows()[0].props.onClick()
+tree = render()
 
 // 3) 取不到事件数据时必须说清楚，而不是静默算成「没有信号」
 eventsAvailable = false

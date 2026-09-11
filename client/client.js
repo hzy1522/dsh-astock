@@ -98,6 +98,13 @@ window.__ModuleLoader__.load({
       '.astk-unverified a{color:inherit;text-decoration:underline}',
       '.astk-btn-mini{padding:1px 6px;font-size:11.5px}',
       '.astk-field-in{padding:4px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px}',
+      // 对话气泡：用户的靠右、AI 的靠左；「做了什么」的元信息另起一行。
+      '.astk-chat{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;max-height:420px;overflow-y:auto}',
+      '.astk-msg{max-width:86%;padding:8px 10px;border-radius:8px;font-size:12.5px;line-height:1.6;white-space:pre-wrap;word-break:break-word}',
+      '.astk-msg-me{align-self:flex-end;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
+      '.astk-msg-ai{align-self:flex-start;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-left:3px solid var(--dsw-alias-brand-primary)}',
+      '.astk-msg-err{border-left-color:var(--dsw-alias-label-secondary)}',
+      '.astk-msg-m{margin-top:4px;font-size:11.5px;color:var(--dsw-alias-label-secondary)}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -637,6 +644,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 取表达式里某个事件因子调用命中的事件列表。
+     *
+     * 事件因子的命中是在求值时就记下来的（按「类型|偏移」缓存），所以这里只要把
+     * 调用的偏移算出来就能取到——算不出来就返回空数组，不影响其它条件。
+     * @param node - call 节点。
+     * @param S - seriesOf() 的结果。
+     * @returns 命中列表（可能为空）。
+     */
+    function hitsOfEventCall(node, S) {
+      try {
+        const kind = EV_KIND[node.name]
+        if (kind === undefined || !S.EV || !Array.isArray(node.args) || node.args.length === 0) return []
+        const series = evalAst(node.args[0], S)
+        let offset = null
+        for (const v of series) if (v !== null && v !== undefined) { offset = v; break }
+        if (offset === null) return []
+        return S.EV.hits[kind + '|' + offset] || []
+      } catch {
+        return []
+      }
+    }
+
+    /**
      * 为一条表达式策略构造解释器。
      *
      * 每个条件的整段序列**只算一次**，之后按信号 bar 取值——不能对每笔交易重算，
@@ -658,6 +688,11 @@ window.__ModuleLoader__.load({
             entry.kind = 'cmp'
             entry.left = evalAst(node.args[0], S)
             entry.right = evalAst(node.args[1], S)
+          } else if (node.k === 'call' && EV_FNS.indexOf(node.name) >= 0 && S.EV) {
+            // 事件因子：求值的时候已经顺手记下了「哪一根命中了哪个真实事件」，
+            // 这里取出来当作这条条件的证据，而不是只给它一个 ✓。
+            entry.kind = 'event'
+            entry.hits = hitsOfEventCall(node, S)
           }
         } catch {
           entry.kind = 'error'
@@ -668,6 +703,11 @@ window.__ModuleLoader__.load({
         if (e.kind === 'error') return { text: e.text, error: true }
         const raw = i >= 0 && i < e.pass.length ? e.pass[i] : null
         const out = { text: e.text, pass: raw === null || raw === undefined ? null : Boolean(raw) }
+        if (e.kind === 'event') {
+          out.detail = '今 ' + num(raw)
+          const hit = (e.hits || []).find((h) => h.target === i)
+          if (hit) out.note = '命中 ' + hit.date + ' ' + hit.title
+        }
         if (e.kind === 'cmp' && e.left !== null && e.right !== null && i >= 0) {
           // 必须同时给出**前一根**：判断「上穿 / 下穿 / 突破」这类条件，
           // 只看当根的值证明不了任何事——交叉需要两根才能成立。
@@ -1341,6 +1381,8 @@ window.__ModuleLoader__.load({
         eventDateDraft: '', eventTitleDraft: '',
         // AI 联网查到的候选事件：要用户点一下确认，才会变成自定义事件参与回测。
         suggestedEvents: [], eventsBusy: false,
+        // 多轮对话：{ role, text（发给模型的历史）, show（气泡里显示）, meta（做了什么） }
+        chat: [], chatBusy: false, exprPrev: null,
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1562,57 +1604,141 @@ window.__ModuleLoader__.load({
        * 都能当场暴露，而不是等用户点了回测才发现。试运行失败也会把代码填进去，
        * 方便用户看见并手动修。
        */
+      /** 这一轮要发给模型的「当前策略」快照：表达式与 JS 各写各的。 */
+      function currentStrategyText(s) {
+        if (s.strategyMode === 'expr') return '买入：' + s.buyExpr + '\n卖出：' + s.sellExpr
+        return s.jsSource
+      }
+
+      /**
+       * 和 AI 聊一轮。
+       *
+       * 多轮对话的上下文由客户端保存，每一轮都带上：模型才知道自己上一版写了什么、
+       * 用户又提了什么要求。返回的策略按 **本轮要求的模式** 应用回编辑器：
+       * 表达式写进买入/卖出条件，JS 写进代码框；只回答问题不给策略时，编辑器不动。
+       * @param override - 直接指定这一轮的用户输入（「一键改写」用）；省略则取输入框。
+       */
       async function generateWithAi(override) {
         const s = store.get()
         const isRewrite = typeof override === 'string' && override !== ''
         const description = isRewrite ? override : s.aiDescription.trim()
         if (description === '') {
-          store.set({ aiError: '先用一句话描述你想要的策略，例如「20 日均线上穿 60 日均线买入，跌破 20 日线卖出」', aiNote: '' })
+          store.set({ aiError: '先用一句话说明你想要的策略，例如「20 日均线上穿 60 日均线买入，跌破 20 日线卖出」', aiNote: '' })
           return
         }
         // 从回测明细点「一键改写」时，跳到策略页让用户看着它发生（成功失败都在那里显示）。
-        store.set(isRewrite ? { aiBusy: true, aiError: '', aiNote: '', tab: 'strategy' } : { aiBusy: true, aiError: '', aiNote: '' })
+        const thread = s.chat.concat([{ role: 'user', text: description, show: description }])
+        store.set({
+          chat: thread, aiDescription: '', chatBusy: true, aiBusy: true, aiError: '', aiNote: '',
+          ...(isRewrite ? { tab: 'strategy' } : {}),
+        })
         try {
           const res = await apiPost('generate-strategy', {
             description,
-            // 只在 JS 模式下把现有代码交给模型，让它在此基础上改。
-            currentCode: s.strategyMode === 'js' ? s.jsSource : '',
-            // 把当前标的的真实事件日期一并交给模型：它自己算不出哪天开发布会、
-            // 更算不出哪天是交易日，不给真实日期它只能编。
+            // 之前几轮原样带上，模型才知道上下文。
+            history: s.chat.map((m) => ({ role: m.role, text: m.text })),
+            // 本轮要哪种模式的策略：表达式还是 JavaScript。
+            mode: s.strategyMode,
+            // 把当前策略也带上（对话里可能丢过一轮），并附上该股的真实事件日期。
+            currentCode: currentStrategyText(s),
             code: s.selected || '',
             name: (s.quote && s.quote.name) || '',
           })
-          const code = String(res.code || '')
-          if (code === '') throw new Error('模型没有返回代码')
-          let note = '已由 ' + String(res.model || '模型') + ' 生成'
+          const suggested = Array.isArray(res.suggestedEvents) ? res.suggestedEvents : []
+          const produced = res.mode === 'expr' ? 'expr' : (String(res.code || '') !== '' ? 'js' : '')
+          const reply = String(res.reply || '').trim()
+          let note = '已由 ' + String(res.model || '模型') + ' 回复'
           if (res.usage && typeof res.usage.outputTokens === 'number') note += '（输出 ' + res.usage.outputTokens + ' tokens）'
           if (res.events > 0) note += '，已把该股 ' + res.events + ' 条真实事件日期交给模型'
-          else if (s.selected) note += '，但该股没有可用的事件数据（已在提示里明确告诉模型不要用事件因子）'
-          // 联网查证：搜了几次、有没有查不到、有没有降级，都要如实说。
+          else if (s.selected) note += '，该股没有可用的事件数据（已明确告诉模型不要用事件因子）'
           if (res.searched) note += '，联网查证 ' + String(res.searches || 0) + ' 次'
           else if (res.searchError) note += '，未能联网查证（' + String(res.searchError) + '）'
-          const suggested = Array.isArray(res.suggestedEvents) ? res.suggestedEvents : []
           if (suggested.length > 0) note += '，查出 ' + suggested.length + ' 个候选日期待你确认'
-          try {
-            const bars = store.get().bars
-            if (bars && bars.length >= 30) {
-              // 试运行要把**候选事件**也算进去：策略引用的正是这些还没确认的日期，
-              // 否则明明能用也会先报一次错，白白吓人一跳。
-              const trialEvents = store.get().events.concat(suggested)
-              runJsStrategy(code, seriesOf(bars, null, trialEvents))
-              note += suggested.length > 0 ? '，已按「交易所事件 + 待确认候选事件」试运行通过' : '，已通过试运行校验'
-            }
-          } catch (error) {
-            note += '；但试运行报错：' + String((error && error.message) || error)
+
+          const patch = { aiNote: note, aiError: '', suggestedEvents: suggested, chatBusy: false, aiBusy: false }
+          let applied = ''
+          let historyText = reply
+          if (produced === 'expr') {
+            applied = applyExprStrategy(res.expr, s)
+            historyText = (reply === '' ? '' : reply + '\n\n') + '```expr\n' + JSON.stringify(res.expr) + '\n```'
+          } else if (produced === 'js') {
+            applied = applyJsStrategy(String(res.code || ''), s, suggested)
+            historyText = (reply === '' ? '' : reply + '\n\n') + '```js\n' + String(res.code || '') + '\n```'
+          } else {
+            // 模型只是在回答/反问：不改编辑器，这正是对话该有的样子。
+            applied = '（本轮只回答，未改动策略）'
           }
-          store.set({
-            jsSource: code, jsSourcePrev: s.jsSource, strategyMode: 'js',
-            aiBusy: false, aiNote: note, aiError: '',
-            suggestedEvents: suggested,
-          })
+          patch.chat = thread.concat([{
+            role: 'assistant',
+            text: historyText,
+            show: reply === '' ? applied : reply,
+            meta: applied,
+          }])
+          store.set(patch)
         } catch (error) {
-          store.set({ aiBusy: false, aiNote: '', aiError: '生成失败：' + String((error && error.message) || error) })
+          store.set({
+            chatBusy: false, aiBusy: false, aiNote: '',
+            aiError: '生成失败：' + String((error && error.message) || error),
+            // 失败时把刚才那句话放回输入框：用户不用重打一遍。
+            aiDescription: description,
+            chat: thread.concat([{ role: 'assistant', text: '', show: '生成失败：' + String((error && error.message) || error), error: true }]),
+          })
         }
+      }
+
+      /**
+       * 把模型给的表达式应用回编辑器，并试运行校验。
+       * @param expr - { buy, sell }。
+       * @param s - 当前状态（用于取 K 线做试运行）。
+       * @returns 给用户看的一句话（含校验结果）。
+       */
+      function applyExprStrategy(expr, s) {
+        const patch = {
+          buyExpr: expr.buy, sellExpr: expr.sell, strategyMode: 'expr',
+          exprPrev: { buy: s.buyExpr, sell: s.sellExpr },
+        }
+        let note = '已更新为表达式策略'
+        try {
+          const bars = store.get().bars
+          if (bars && bars.length >= 30) {
+            const S = seriesOf(bars, null, store.get().events)
+            evalAst(parseSource(expr.buy), S)
+            evalAst(parseSource(expr.sell), S)
+            note += '，已通过试运行校验'
+          }
+        } catch (error) {
+          note += '；但试运行报错：' + String((error && error.message) || error)
+        }
+        store.set(patch)
+        return note
+      }
+
+      /**
+       * 把模型给的 JS 应用回编辑器，并试运行校验。
+       *
+       * 试运行把**待确认的候选事件**也算进去：策略引用的正是这些日期，
+       * 否则明明能用也会先报一次错。
+       * @param code - 策略源码。
+       * @param s - 当前状态。
+       * @param suggested - 本轮联网查到的候选事件。
+       * @returns 给用户看的一句话（含校验结果）。
+       */
+      function applyJsStrategy(code, s, suggested) {
+        let note = '已更新为 JavaScript 策略'
+        try {
+          const bars = store.get().bars
+          if (bars && bars.length >= 30) {
+            const trialEvents = store.get().events.concat(suggested || [])
+            runJsStrategy(code, seriesOf(bars, null, trialEvents))
+            note += (suggested && suggested.length > 0)
+              ? '，已按「交易所事件 + 待确认候选事件」试运行通过'
+              : '，已通过试运行校验'
+          }
+        } catch (error) {
+          note += '；但试运行报错：' + String((error && error.message) || error)
+        }
+        store.set({ jsSource: code, jsSourcePrev: s.jsSource, strategyMode: 'js' })
+        return note
       }
 
       /**
@@ -2239,6 +2365,9 @@ window.__ModuleLoader__.load({
           const modeButtons = [['expr', '表达式'], ['js', 'JavaScript']].map((pair) => React.createElement('button', {
             key: pair[0],
             className: 'astk-btn' + (s.strategyMode === pair[0] ? ' astk-btn-on' : ''),
+            // 带上稳定的 data-astk：界面上还有「换回上一版表达式」这类按钮，
+            // 按文字找会误中（测试踩过这个坑）。
+            'data-astk': 'mode-' + pair[0],
             onClick: () => store.set({ strategyMode: pair[0] }),
           }, pair[1]))
 
@@ -2322,24 +2451,47 @@ window.__ModuleLoader__.load({
               })())
               : null)
 
+          // 多轮对话：气泡展示，每一轮 AI 都会给出完整的新策略并填进编辑器。
+          const chatBubbles = s.chat.map((m, i) => React.createElement('div', {
+            key: 'msg' + i,
+            className: 'astk-msg astk-msg-' + (m.role === 'user' ? 'me' : 'ai') + (m.error ? ' astk-msg-err' : ''),
+            'data-astk': 'chat-' + m.role,
+          },
+          React.createElement('div', { className: 'astk-msg-b' }, m.show),
+          m.meta ? React.createElement('div', { className: 'astk-msg-m' }, m.meta) : null))
+
           const aiSection = React.createElement('div', { className: 'astk-sec' },
-            React.createElement('h4', null, '让 AI 生成策略（用文字描述）'),
+            React.createElement('h4', null, '和 AI 一起改策略（多轮对话）'),
+            s.chat.length === 0
+              ? React.createElement('div', { className: 'astk-note' },
+                  '用一句话说清你想要什么，然后一直追问下去——每一轮它都会给出**完整的**新策略并填进上面的编辑器。')
+              : React.createElement('div', { className: 'astk-chat', 'data-astk': 'chat-log' }, chatBubbles),
             React.createElement('textarea', {
               className: 'astk-ta', rows: 3, value: s.aiDescription,
               'data-astk': 'ai-description',
-              placeholder: '例如：20 日均线上穿 60 日均线时买入，跌破 20 日均线时卖出。\n也可以写事件类需求：公司开业绩说明会的前一个交易日卖出，会后的第二个交易日买入。',
+              placeholder: s.chat.length === 0
+                ? '例如：20 日均线上穿 60 日均线时买入，跌破 20 日均线时卖出。\n也可以写事件类需求：公司开业绩说明会的前一个交易日卖出，会后的第二个交易日买入。'
+                : '继续说你的要求，例如「再加一个放量过滤」「止损改成跌破 30 日线」「只在均线多头排列时买」',
               onChange: (e) => store.set({ aiDescription: e.target.value }),
             }),
-            React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
+            React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px', flexWrap: 'wrap' } },
               React.createElement('button', {
                 className: 'astk-btn astk-btn-on',
-                disabled: s.aiBusy,
+                disabled: s.chatBusy,
+                'data-astk': 'ai-send',
                 onClick: () => { void generateWithAi() },
-              }, s.aiBusy ? '生成中…' : 'AI 生成代码'),
+              }, s.chatBusy ? '思考中…' : (s.chat.length === 0 ? '发送' : '继续追问')),
+              s.chat.length > 0
+                ? React.createElement('button', {
+                    className: 'astk-btn',
+                    'data-astk': 'chat-reset',
+                    onClick: () => store.set({ chat: [], aiNote: '', aiError: '' }),
+                  }, '清空对话')
+                : null,
               React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
                 s.strategyMode === 'js'
-                  ? '当前是 JS 模式：会把你现有的代码一起交给模型，让它在此基础上改。'
-                  : '生成后会切到 JavaScript 模式并填入代码。')),
+                  ? '当前是 JS 模式：会让模型输出 JS。'
+                  : '当前是表达式模式：会让模型输出表达式；需求必须用循环/状态时它会改用 JS 并说明原因。')),
             s.aiNote ? React.createElement('div', { className: 'astk-note' }, '✓ ' + s.aiNote) : null,
             s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null,
             // AI 联网查到的日期：必须由用户点一下确认，才会变成可回测的自定义事件。
@@ -2377,12 +2529,25 @@ window.__ModuleLoader__.load({
                     className: 'astk-btn',
                     'data-astk': 'js-restore',
                     onClick: () => store.set({ jsSource: s.jsSourcePrev, jsSourcePrev: s.jsSource }),
-                  }, '↺ 换回改写前的代码'),
+                  }, '↺ 换回上一版代码'),
                   React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
-                    'AI 改写会覆盖文本框里的内容，旧代码留在这里随时可换回来。'))
+                    'AI 会覆盖编辑器里的内容，旧版本留在这里随时可换回来。'))
+              : null,
+            s.exprPrev
+              ? React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px' } },
+                  React.createElement('button', {
+                    className: 'astk-btn',
+                    'data-astk': 'expr-restore',
+                    onClick: () => store.set({
+                      buyExpr: s.exprPrev.buy, sellExpr: s.exprPrev.sell,
+                      exprPrev: { buy: s.buyExpr, sell: s.sellExpr },
+                    }),
+                  }, '↺ 换回上一版表达式'),
+                  React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
+                    '上一版：' + s.exprPrev.buy + '　/　' + s.exprPrev.sell))
               : null,
             React.createElement('div', { className: 'astk-note' },
-              'AI 生成的策略代码仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'),
+              'AI 给出的策略仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'),
             // 没有事件数据时先说清楚：否则用户会拿到一个一跑就报错的事件策略。
             s.selected && !s.eventsLoading && s.events.length === 0
               ? React.createElement('div', { className: 'astk-warn', 'data-astk': 'no-events-warn' },

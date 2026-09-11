@@ -450,6 +450,121 @@ console.log('\n[9b] 联网查证（多轮工具调用）')
   check('没有 web 服务时仍能生成', typeof noWeb.body.code === 'string' && noWeb.body.code.includes('MA(C, 20)'))
 }
 
+console.log('\n[9d] 多轮对话 + 表达式模式')
+{
+  const textOf = (m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')
+
+  // 表达式模式：模型给 ```expr 块
+  llmCalls.length = 0
+  llmChunks = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '把买入改成金叉且放量，卖出改成跌破 20 日线。\n```expr\n'
+        + JSON.stringify({ buy: 'CROSS(MA(5),MA(20)) AND V>MA(V,20)', sell: 'C<MA(20)' })
+        + '\n```',
+    },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const exprRun = await call('/astock/api/generate-strategy', {
+    body: { description: '改成金叉放量买', mode: 'expr', code: '600519', history: [] },
+  })
+  check('表达式模式 HTTP 200', exprRun.status === 200, JSON.stringify(exprRun.body).slice(0, 120))
+  check('解析出表达式', exprRun.body.mode === 'expr' && exprRun.body.expr !== null,
+    JSON.stringify(exprRun.body.expr))
+  check('买卖两段表达式都在',
+    exprRun.body.expr.buy.includes('CROSS') && exprRun.body.expr.sell === 'C<MA(20)', JSON.stringify(exprRun.body.expr))
+  check('说明文字里没有代码块', !exprRun.body.reply.includes('```') && exprRun.body.reply.includes('金叉'),
+    exprRun.body.reply)
+  check('表达式模式不返回 JS 代码', exprRun.body.code === '')
+  check('系统提示里有表达式规则', llmCalls[0].system.includes('```expr') && llmCalls[0].system.includes('表达式模式规则'))
+  check('系统提示指出了本轮要求的模式', llmCalls[0].system.includes('【本轮要求的模式：表达式 expr】'))
+  check('系统提示说明了表达式没有循环', llmCalls[0].system.includes('没有循环与变量'))
+
+  // 多轮：历史要原样带上，且在最新一轮之前
+  llmCalls.length = 0
+  const history = [
+    { role: 'user', text: '我要一个均线策略' },
+    { role: 'assistant', text: '好的，先用 5/20 金叉。' },
+  ]
+  await call('/astock/api/generate-strategy', {
+    body: { description: '再加一个放量过滤', mode: 'expr', code: '600519', history },
+  })
+  const sent = llmCalls[0].messages
+  check('历史进了 messages', sent.length === 3, sent.length + ' 条')
+  check('角色顺序正确', sent[0].role === 'user' && sent[1].role === 'assistant' && sent[2].role === 'user',
+    sent.map((m) => m.role).join(','))
+  check('历史内容原样保留', textOf(sent[1]).includes('5/20 金叉'), textOf(sent[1]))
+  check('最新一轮带上了本轮需求', textOf(sent[2]).includes('再加一个放量过滤'))
+
+  // 历史要被裁剪与限长，别把整段对话无限塞进请求
+  llmCalls.length = 0
+  const longHistory = []
+  for (let i = 0; i < 40; i += 1) longHistory.push({ role: i % 2 === 0 ? 'user' : 'assistant', text: '第' + i + '轮' })
+  await call('/astock/api/generate-strategy', {
+    body: { description: '继续', mode: 'js', code: '600519', history: longHistory },
+  })
+  check('历史只保留最近 20 条', llmCalls[0].messages.length === 21, llmCalls[0].messages.length + ' 条')
+
+  // 模型只是在回答/反问：这不是错误
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '你希望用几分钟均线？另外要不要考虑成交量？' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const ask = await call('/astock/api/generate-strategy', {
+    body: { description: '随便来个策略', mode: 'js', code: '600519', history: [] },
+  })
+  check('反问式回答不报错', ask.status === 200, JSON.stringify(ask.body).slice(0, 100))
+  check('反问标记为 plain', ask.body.plain === true && ask.body.mode === '', JSON.stringify({ mode: ask.body.mode, plain: ask.body.plain }))
+  check('反问文字原样带回', ask.body.reply.includes('几分钟均线'), ask.body.reply)
+  check('反问时不返回代码', ask.body.code === '' && ask.body.expr === null)
+
+  // 要表达式但模型给了 JS（需求需要循环）：如实回报实际产出的模式
+  llmCalls.length = 0
+  llmChunks = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '这个需求需要 JavaScript 模式，因为要记持有天数。\n```js\nconst buy = []\nreturn { buy, sell: buy }\n```',
+    },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const fellBack = await call('/astock/api/generate-strategy', {
+    body: { description: '持有满 5 天才卖', mode: 'expr', code: '600519', history: [] },
+  })
+  check('模型改用 JS 时如实回报', fellBack.body.mode === 'js' && fellBack.body.code.includes('const buy'),
+    JSON.stringify({ mode: fellBack.body.mode, code: fellBack.body.code.slice(0, 20) }))
+  check('并保留了「需要 JS 模式」的说明', fellBack.body.reply.includes('JavaScript 模式'), fellBack.body.reply)
+
+  // 没有围栏但整段就是代码：也要认出来（模型偶尔忘记加围栏）
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: 'const a = MA(C, 5)\nreturn { buy: GT(C, a), sell: LT(C, a) }' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const bare = await call('/astock/api/generate-strategy', {
+    body: { description: '收盘价上穿 5 日线买', mode: 'js', code: '600519', history: [] },
+  })
+  check('没有围栏的纯代码也能识别', bare.body.mode === 'js' && bare.body.code.includes('MA(C, 5)'),
+    JSON.stringify({ mode: bare.body.mode, code: bare.body.code.slice(0, 24) }))
+
+  // 表达式里用到的事件因子必须能被解析出来（含负数参数）
+  llmCalls.length = 0
+  llmChunks = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '```expr\n' + JSON.stringify({ buy: 'EVCUS(2)', sell: 'EVCUS(-1)' }) + '\n```',
+    },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const withEvent = await call('/astock/api/generate-strategy', {
+    body: { description: '发布会前后', mode: 'expr', code: '600519', history: [] },
+  })
+  check('表达式里的负数事件参数原样保留', withEvent.body.expr.sell === 'EVCUS(-1)', withEvent.body.expr.sell)
+}
+
 console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效）')
 {
   await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
