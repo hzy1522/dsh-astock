@@ -2,7 +2,7 @@
 
 A股港股量化工作台 —— DeepSeek Harness 插件。
 
-**当前版本 `0.4.0`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
+**当前版本 `0.4.1`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
 
 在侧边栏底部提供独立的「A股港股」整页：**A 股与港股**的自选股管理、K线图、公司财务数据、策略配置与回测。
 
@@ -287,6 +287,15 @@ curl -s --max-time 5 http://127.0.0.1:3080/plugins/events \
 
 每个版本对应一次 GitHub 提交与一次 npm 发布。完整提交历史见
 [commits](https://github.com/hzy1522/dsh-astock/commits/main)。
+
+### 0.4.1
+
+**文档发布：让 npm 页面同步 README**
+
+- 纯文档版本，**无代码变更**。npm 上已发布的版本不能修改，`0.4.0` 的 README 里没有版本记录，
+  这个版本只为把最新文档同步到 npm 页面。
+- 之所以单独发一版而不是等下次代码改动：npm 页面的 README 是给使用者看的第一手材料，
+  版本记录留在那里才有意义。
 
 ### 0.4.0
 
