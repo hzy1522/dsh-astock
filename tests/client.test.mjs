@@ -89,8 +89,20 @@ let generateFixture = {
   provider: 'stub', model: 'stub-model', usage: { inputTokens: 120, outputTokens: 42 },
 }
 let generateError = null
+// 免责声明：默认为「已确认」，其它用例才不会被确认弹窗干扰；
+// 专门的用例再把它翻成未确认。
+let disclaimerAccepted = true
+let disclaimerAcceptFails = false
+const makeDisclaimer = (accepted) => ({
+  version: '1',
+  title: '免责声明与使用条款',
+  paragraphs: ['1. 仅用于学习研究，不构成任何投资建议。', '2. 数据来自第三方接口，不作任何保证。'],
+  short: '本工具仅用于研究与学习，不构成投资建议。数据来自第三方，回测不代表未来收益，据此操作风险自负。',
+  accepted,
+  acceptedAt: accepted ? '2026-09-11T00:00:00.000Z' : null,
+})
 const fetchCalls = []
-globalThis.fetch = async (url) => {
+globalThis.fetch = async (url, init) => {
   const raw = String(url)
   fetchCalls.push(raw)
   const [path, search] = raw.split('?')
@@ -98,6 +110,14 @@ globalThis.fetch = async (url) => {
   if (key === 'generate-strategy') {
     if (generateError !== null) return { ok: false, status: 500, json: async () => ({ error: generateError }) }
     return { ok: true, status: 200, json: async () => generateFixture }
+  }
+  if (key === 'disclaimer') {
+    if (init !== undefined && init.method === 'POST') {
+      if (disclaimerAcceptFails) return { ok: false, status: 500, json: async () => ({ error: '写盘失败' }) }
+      disclaimerAccepted = true
+      return { ok: true, status: 200, json: async () => makeDisclaimer(true) }
+    }
+    return { ok: true, status: 200, json: async () => makeDisclaimer(disclaimerAccepted) }
   }
   if (key === 'quote') {
     const code = new URLSearchParams(search || '').get('code')
@@ -510,6 +530,52 @@ check('「近10年」写入起始日', String(byData('date-btFrom').props.value)
 check('选更长档位会自动调大 K 线年数并重新取数',
   fetchCalls.slice(callsBeforeBump).some((u) => u.includes('kline') && u.includes('years=10')),
   fetchCalls.slice(callsBeforeBump).filter((u) => u.includes('kline')).join(' | ') || '没有发起新的取数')
+
+console.log('\n[5f] 免责声明')
+
+const classNameOf = (n) => String(n.props.className || '')
+const hasGate = () => collect(tree).some((n) => classNameOf(n) === 'astk-gate')
+
+// 页脚常驻：无论确认与否都应可见，这是「即使弹窗没出来声明也在」的兜底
+check('页脚常驻显示免责声明', collectText(tree).includes('不构成投资建议'), (collectText(tree).match(/⚠️[^⚠]{0,50}/) || ['未找到页脚'])[0])
+check('已确认时不弹确认框', hasGate() === false)
+
+// 翻成未确认并重新挂载（模拟首次打开）
+disclaimerAccepted = false
+hookState.length = 0
+hookIndex = 0
+tree = render()
+await tick(); await tick()
+tree = render()
+const gateText = collectText(tree)
+check('未确认时弹出确认框', hasGate())
+check('弹窗显示条款标题', gateText.includes('免责声明与使用条款'))
+check('弹窗列出全部条款', gateText.includes('不构成任何投资建议') && gateText.includes('不作任何保证'))
+check('弹窗有确认按钮', findButton(tree, '我已阅读并理解') !== undefined)
+
+findButton(tree, '我已阅读并理解').props.onClick()
+tree = render()
+await tick(); await tick()
+tree = render()
+check('确认后弹窗消失', hasGate() === false)
+check('确认后页脚仍在', collectText(tree).includes('不构成投资建议'))
+
+// 确认写盘失败：弹窗必须保留，不能「点了就等于同意」
+disclaimerAccepted = false
+disclaimerAcceptFails = true
+hookState.length = 0
+hookIndex = 0
+tree = render()
+await tick(); await tick()
+tree = render()
+check('（重置）未确认时再次弹出', hasGate())
+findButton(tree, '我已阅读并理解').props.onClick()
+tree = render()
+await tick(); await tick()
+tree = render()
+check('确认失败时弹窗保留', hasGate())
+check('确认失败时给出提示', collectText(tree).includes('免责声明确认未保存'), (collectText(tree).match(/免责声明确认未保存[^。]{0,30}/) || ['无提示'])[0])
+disclaimerAcceptFails = false
 
 console.log('\n[6] 图标组件')
 const icon = iconReg.component({ size: 20, active: true })

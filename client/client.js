@@ -18,7 +18,12 @@ window.__ModuleLoader__.load({
     const React = require('react')
 
     const CSS = [
-      '.astk-root{display:flex;flex-direction:column;height:100%;min-height:0;font-size:13px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base)}',
+      '.astk-root{position:relative;display:flex;flex-direction:column;height:100%;min-height:0;font-size:13px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base)}',
+      '.astk-gate{position:absolute;inset:0;z-index:20;background:var(--dsw-alias-bg-overlay);display:flex;align-items:center;justify-content:center;padding:24px}',
+      '.astk-gate-card{max-width:760px;width:100%;max-height:100%;overflow:auto;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:20px 24px;box-shadow:0 12px 40px rgba(0,0,0,.28)}',
+      '.astk-gate-card h3{margin:0 0 4px;font-size:16px}',
+      '.astk-gate-card p{margin:0 0 10px;font-size:12.5px;line-height:1.8;color:var(--dsw-alias-label-primary)}',
+      '.astk-foot{flex:0 0 auto;border-top:1px solid var(--dsw-alias-border-l1);padding:6px 14px;font-size:11px;line-height:1.6;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1)}',
       '.astk-head{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--dsw-alias-border-l1);flex:0 0 auto}',
       '.astk-title{font-weight:600;font-size:14px;white-space:nowrap}',
       '.astk-body{display:flex;flex:1 1 auto;min-height:0}',
@@ -780,6 +785,7 @@ window.__ModuleLoader__.load({
         buyExpr: firstTpl.buy(defaultParams(firstTpl)), sellExpr: firstTpl.sell(defaultParams(firstTpl)),
         jsSource: DEFAULT_JS,
         aiDescription: '', aiBusy: false, aiError: '', aiNote: '',
+        disclaimer: null, disclaimerBusy: false,
         capital: 1000000, commission: 0.00025, stampTax: 0.0005, stampTaxBuy: 0, transferFee: 0.00001, slippage: 0.001,
         btFrom: yearsAgoISO(DEFAULT_BT_YEARS), btTo: '',
         bt: null, btRunning: false,
@@ -909,6 +915,19 @@ window.__ModuleLoader__.load({
         const patch = { params: p, buyExpr: tpl.buy(p), sellExpr: tpl.sell(p) }
         if (typeof tpl.js === 'function') patch.jsSource = tpl.js(p)
         store.set(patch)
+      }
+
+      /**
+       * 提交免责声明确认，落盘后不再弹出。
+       */
+      async function acceptDisclaimer() {
+        store.set({ disclaimerBusy: true })
+        try {
+          const res = await apiPost('disclaimer', { accept: true })
+          store.set({ disclaimer: res, disclaimerBusy: false })
+        } catch (error) {
+          store.set({ disclaimerBusy: false, note: '免责声明确认未保存：' + String((error && error.message) || error) })
+        }
       }
 
       /**
@@ -1220,6 +1239,16 @@ window.__ModuleLoader__.load({
           return () => { alive = false }
         }, [])
 
+        // 拉取免责声明确认状态。失败时保持 null（不弹窗）——页脚的常驻声明
+        // 仍然可见，所以不会出现「既没弹窗也看不到声明」的空档。
+        React.useEffect(() => {
+          let alive = true
+          api('disclaimer')
+            .then((res) => { if (alive) store.set({ disclaimer: res }) })
+            .catch(() => { if (alive) store.set({ disclaimer: null }) })
+          return () => { alive = false }
+        }, [])
+
         const bars = s.bars || []
         const n = bars.length
         const span = Math.min(s.span, Math.max(1, n))
@@ -1466,7 +1495,9 @@ window.__ModuleLoader__.load({
                   ? '当前是 JS 模式：会把你现有的代码一起交给模型，让它在此基础上改。'
                   : '生成后会切到 JavaScript 模式并填入代码。')),
             s.aiNote ? React.createElement('div', { className: 'astk-note' }, '✓ ' + s.aiNote) : null,
-            s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null)
+            s.aiError ? React.createElement('div', { className: 'astk-err' }, s.aiError) : null,
+            React.createElement('div', { className: 'astk-note' },
+              'AI 生成的策略代码仅供参考，未经审核，可能有逻辑错误或隐含风险；请自行阅读并验证后再用于回测。'))
 
           content = React.createElement('div', null,
             rangeSection,
@@ -1546,7 +1577,9 @@ window.__ModuleLoader__.load({
               React.createElement('td', { className: tone(t.ret) }, (t.ret >= 0 ? '+' : '') + (t.ret * 100).toFixed(2) + '%'),
               React.createElement('td', null, t.days)))
             content = React.createElement('div', null,
-              React.createElement('div', { className: 'astk-sec' }, grid, spanLine),
+              React.createElement('div', { className: 'astk-sec' }, grid, spanLine,
+                React.createElement('div', { className: 'astk-warn' },
+                  '以上为历史数据回测结果，不代表未来表现，也不构成任何投资建议。')),
               hintNodes.length > 0 ? React.createElement('div', { className: 'astk-sec' }, React.createElement('h4', null, '提示'), hintNodes) : null,
               React.createElement('div', { className: 'astk-sec' },
                 React.createElement('h4', null, '资金曲线（归一化，虚线为 1.0 基准）'),
@@ -1600,9 +1633,35 @@ window.__ModuleLoader__.load({
           React.createElement('div', { className: 'astk-tabs' }, tabs),
           content)
 
+        // 首次使用（或条款版本变更）时的强制确认。落盘后不再出现。
+        const d = s.disclaimer
+        const gate = d !== null && d.accepted !== true
+          ? React.createElement('div', { className: 'astk-gate' },
+              React.createElement('div', { className: 'astk-gate-card' },
+                React.createElement('h3', null, d.title || '免责声明'),
+                React.createElement('div', { className: 'astk-note' }, '请阅读并确认后继续使用。'),
+                (d.paragraphs || []).map((text, i) => React.createElement('p', { key: 'p' + i }, text)),
+                React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '6px' } },
+                  React.createElement('button', {
+                    className: 'astk-btn astk-btn-on',
+                    disabled: s.disclaimerBusy,
+                    onClick: () => { void acceptDisclaimer() },
+                  }, s.disclaimerBusy ? '提交中…' : '我已阅读并理解，开始使用'),
+                  React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
+                    '确认后不再弹出；条款有实质修改时会重新提示。'))))
+          : null
+
+        // 常驻页脚：即使弹窗因接口失败没能出现，声明也始终可见。
+        const footText = d !== null && typeof d.short === 'string' && d.short !== ''
+          ? d.short
+          : '本工具仅用于研究与学习，不构成投资建议。数据来自第三方，回测不代表未来收益，据此操作风险自负。'
+        const foot = React.createElement('div', { className: 'astk-foot' }, '⚠️ ' + footText)
+
         return React.createElement('div', { className: 'astk-root' },
           head,
-          React.createElement('div', { className: 'astk-body' }, side, main))
+          React.createElement('div', { className: 'astk-body' }, side, main),
+          foot,
+          gate)
       }
 
       function Icon(props) {

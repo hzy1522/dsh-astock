@@ -7,13 +7,16 @@
  * 重点验证：fetchText 的 GBK 解码（这是从动态插件迁移到正式插件后
  * 新增的、最容易出错的一环——原本由 host 的 web 服务代劳）。
  */
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as host from '../lib/index.js'
 
 // 测试运行在受沙箱限制的 shell 中，无法写 ~/.dsh，因此把落盘目录
 // 重定向到工作区。真实插件由用户进程启动，不受此限制。
 // 注意用 fileURLToPath 而非 URL.pathname —— 后者会把路径中的中文百分号编码。
-process.env.DSH_ASTOCK_HOME = fileURLToPath(new URL('./.tmp-store', import.meta.url))
+const TEST_STORE = fileURLToPath(new URL('./.tmp-store', import.meta.url))
+process.env.DSH_ASTOCK_HOME = TEST_STORE
 
 const routes = new Map()
 // 捕获 generateStrategy 交给 llm 的请求，用于断言请求形状。
@@ -74,7 +77,7 @@ console.log('[1] 插件契约')
 check('导出 name', host.name === 'astock', host.name)
 check('导出 inject 含 webServer', Array.isArray(host.inject) && host.inject.includes('webServer'), JSON.stringify(host.inject))
 check('导出 apply 函数', typeof host.apply === 'function')
-check('注册了 7 条路由', routes.size === 7, [...routes.keys()].join(', '))
+check('注册了 8 条路由', routes.size === 8, [...routes.keys()].join(', '))
 
 console.log('\n[2] health 路由')
 {
@@ -271,6 +274,53 @@ console.log('\n[10] 港股')
   // 财务：东财该报表不覆盖港股，必须给明确提示而不是空表
   const fin = await call('/astock/api/financials', { query: 'code=00700' })
   check('港股财务返回可读错误', fin.status === 500 && String(fin.body.error).includes('港股'), fin.body.error)
+}
+
+console.log('\n[11] 免责声明')
+{
+  // 清掉可能残留的确认记录，从「未确认」开始
+  try { rmSync(join(TEST_STORE, 'disclaimer.json')) } catch { /* 本来就没有 */ }
+
+  const fresh = await call('/astock/api/disclaimer')
+  check('HTTP 200', fresh.status === 200, JSON.stringify(fresh.body).slice(0, 80))
+  check('初始为未确认', fresh.body.accepted === false)
+  check('带版本号', typeof fresh.body.version === 'string' && fresh.body.version !== '', fresh.body.version)
+  check('带标题与完整条款', typeof fresh.body.title === 'string' && Array.isArray(fresh.body.paragraphs) && fresh.body.paragraphs.length >= 5, (fresh.body.paragraphs || []).length + ' 条')
+  check('带页脚精简版', typeof fresh.body.short === 'string' && fresh.body.short.includes('不构成投资建议'), fresh.body.short)
+
+  // 条款必须覆盖这几件关键事，否则免责就是摆设
+  const all = (fresh.body.paragraphs || []).join('\n')
+  check('声明了不构成投资建议', all.includes('不构成任何投资建议'))
+  check('声明了数据来自第三方且不保证准确', all.includes('第三方公开接口') && all.includes('作任何保证'))
+  check('声明了回测不代表未来', all.includes('不能代表未来表现'))
+  check('声明了港股未复权', all.includes('港股数据来自腾讯') && all.includes('复权'))
+  check('声明了 AI 生成代码需自行验证', all.includes('AI 生成的策略代码仅供参考'))
+  check('声明了损失自负', all.includes('自行承担'))
+  check('声明了禁止违法用途', all.includes('内幕交易') || all.includes('违法用途'))
+
+  const accepted = await call('/astock/api/disclaimer', { body: { accept: true } })
+  check('确认后 accepted=true', accepted.body.accepted === true)
+  check('确认后带上时间戳', typeof accepted.body.acceptedAt === 'string' && accepted.body.acceptedAt.includes('T'), accepted.body.acceptedAt)
+
+  const again = await call('/astock/api/disclaimer')
+  check('确认状态已落盘', again.body.accepted === true)
+  check('落盘文件含版本号', (() => {
+    try {
+      const saved = JSON.parse(readFileSync(join(TEST_STORE, 'disclaimer.json'), 'utf8'))
+      return saved.version === fresh.body.version
+    } catch { return false }
+  })())
+
+  // 条款版本变更 -> 旧确认失效，应重新提示
+  const stale = { version: '0', acceptedAt: new Date().toISOString() }
+  mkdirSync(TEST_STORE, { recursive: true })
+  writeFileSync(join(TEST_STORE, 'disclaimer.json'), JSON.stringify(stale), 'utf8')
+  const afterBump = await call('/astock/api/disclaimer')
+  check('条款版本变更后重新要求确认', afterBump.body.accepted === false, '旧版本 ' + stale.version + ' vs 当前 ' + afterBump.body.version)
+
+  // 非 accept 的 POST 不应误确认
+  const notAccept = await call('/astock/api/disclaimer', { body: { accept: false } })
+  check('accept=false 不会误确认', notAccept.body.accepted === false)
 }
 
 console.log('\n================  ' + pass + ' 通过 / ' + fail + ' 失败  ================')
