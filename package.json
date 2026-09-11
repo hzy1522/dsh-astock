@@ -1,6 +1,6 @@
 {
   "name": "dsh-astock",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "A股 / 港股量化工作台：自选股、K线图、公司数据、策略配置与回测。 · A-share & Hong Kong stock quant workbench for DeepSeek Harness.",
   "type": "module",
   "license": "MIT",

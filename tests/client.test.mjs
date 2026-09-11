@@ -117,6 +117,19 @@ const EVENTS = {
 // 客户端 POST 上来的自定义事件：存起来，好让后面的读取能看到。
 let customEvents = []
 let eventsAvailable = true
+// 公司数据 AI 对话的响应可被测试改写。
+let companyChatError = null
+// 自定义数据源（内存版）
+let dataSources = [{ id: 'cninfo', name: '巨潮公告', url: 'https://api.example.com/ann?code={code}', note: '用它查公告原文。', enabled: true }]
+let companyChatReply = {
+  reply: '查到 2026 年 9 月 7 日有一场新品发布会。',
+  events: [{ date: '2026-09-07', title: '小米秋季旗舰新品发布会', source: 'https://example.com/x', evidence: '9月7日晚举行' }],
+  added: 1, searched: true, searches: 1, searchedSource: 'builtin', builtinSearch: true, searchError: '', usedTools: ['mcp__finance__company_events'],
+  payload: {
+    events: [{ date: '2026-09-07', kind: 'custom', title: '小米秋季旗舰新品发布会', announcedAt: null, actual: null, source: 'AI 联网检索（未核实）', url: 'https://example.com/x', verified: false }],
+    counts: { meeting: 0, report: 0, exdiv: 0, custom: 1 }, note: '',
+  },
+}
 // 让测试可以模拟「指数取不到」的情况
 let indexAvailable = true
 // AI 生成接口的响应可被测试改写，用来验证成功与失败两条路径。
@@ -157,6 +170,24 @@ globalThis.fetch = async (url, init) => {
       return { ok: true, status: 200, json: async () => makeDisclaimer(true) }
     }
     return { ok: true, status: 200, json: async () => makeDisclaimer(disclaimerAccepted) }
+  }
+  if (key === 'data-sources') {
+    if (init !== undefined && init.method === 'POST') {
+      const payload = JSON.parse(String(init.body || '{}'))
+      dataSources = Array.isArray(payload.items) ? payload.items : []
+    }
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        items: dataSources,
+        webSearch: true,
+        registry: { toolsReachable: false, reason: '插件上下文里的 tools 服务只有 register/schemas/get，没有 execute。' },
+      }),
+    }
+  }
+  if (key === 'company-chat') {
+    if (companyChatError !== null) return { ok: false, status: 500, json: async () => ({ error: companyChatError }) }
+    return { ok: true, status: 200, json: async () => companyChatReply }
   }
   if (key === 'custom-events') {
     const payload = JSON.parse(String((init && init.body) || '{}'))
@@ -774,6 +805,108 @@ click('策略配置')
 ruleText = collectText(tree)
 check('切回 A 股后规则变回 T+1', ruleText.includes('A股') && ruleText.includes('T+1'))
 check('A 股规则提到涨跌停', ruleText.includes('涨跌停'))
+
+console.log('\n[5d2] 公司数据：AI 查动态 + 自动填表 + 外部数据源')
+{
+  const sendCompany = (text) => {
+    if (byData('company-input') === undefined) click('公司数据')
+    setField('company-input', text)
+    collect(tree).find((n) => n.props['data-astk'] === 'company-send').props.onClick()
+    tree = render()
+  }
+  // company-chat 的请求体：有 code/description/history，但没有 mode/currentCode（那是生成策略的）
+  const lastCompanyReq = () => fetchBodies.map((b) => { try { return JSON.parse(b) } catch { return {} } })
+    .filter((b) => b.code !== undefined && typeof b.description === 'string'
+      && b.mode === undefined && b.currentCode === undefined && b.items === undefined).pop()
+  const companyBubbles = (role) => collect(tree).filter((n) => n.props['data-astk'] === 'company-' + role).length
+
+  companyChatError = null
+  clickWatch('汇丰控股')
+  await tick(); await tick()
+  tree = render()
+  click('公司数据')
+  const companyText = collectText(tree)
+  check('公司数据页有 AI 查询入口', companyText.includes('和 AI 一起查公司动态') && byData('company-input') !== undefined)
+  check('页面说明了会自动填表', companyText.includes('自动填进下面的表'))
+
+  // 外部数据源：列出已配置的 HTTP 接口，并如实说明为什么不能直接调 MCP
+  check('列出已配置的数据源', companyText.includes('巨潮公告') && companyText.includes('https://api.example.com/ann?code={code}'))
+  check('列出数据源的说明', companyText.includes('用它查公告原文'))
+  check('说明了为什么不能直接调用 MCP 工具', companyText.includes('没有 execute') || companyText.includes('为什么不直接调用 MCP'))
+  check('有添加数据源的入口', byData('src-add') !== undefined && byData('src-url') !== undefined)
+
+  // 新增一个数据源
+  setField('src-name', '新闻检索')
+  setField('src-url', 'https://api.example.com/news?q={query}')
+  setField('src-note', '用它查新闻。')
+  collect(tree).find((n) => n.props['data-astk'] === 'src-add').props.onClick()
+  tree = render()
+  await tick()
+  tree = render()
+  check('新增的数据源已保存', dataSources.length === 2 && dataSources[1].name === '新闻检索', JSON.stringify(dataSources.map((x) => x.name)))
+  check('新增后清空草稿', byData('src-name').props.value === '', byData('src-name').props.value)
+  check('新增的数据源渲染出来', collectText(tree).includes('新闻检索'))
+
+  // 删除一个数据源
+  collect(tree).find((n) => n.props['data-astk'] === 'src-del-cninfo').props.onClick()
+  tree = render()
+  await tick()
+  tree = render()
+  check('删除后只剩一个', dataSources.length === 1 && dataSources[0].name === '新闻检索', JSON.stringify(dataSources.map((x) => x.name)))
+  // 还原成初始状态，后面的对话用例不受影响
+  dataSources = [{ id: 'cninfo', name: '巨潮公告', url: 'https://api.example.com/ann?code={code}', note: '用它查公告原文。', enabled: true }]
+  hookState.length = 0
+  hookIndex = 0
+  tree = render()
+  await tick(); await tick(); await tick()
+  tree = render()
+  // 重挂载会自动选回第一只股票，这里再切回港股，后面的断言才稳定。
+  clickWatch('汇丰控股')
+  await tick(); await tick()
+  tree = render()
+  click('公司数据')
+
+  // 发一轮：请求要带上勾选的工具；返回后事件自动进表
+  companyChatReply.payload.events = [{
+    date: '2026-09-07', kind: 'custom', title: '小米秋季旗舰新品发布会', announcedAt: null, actual: null,
+    source: 'AI 联网检索（未核实）', url: 'https://example.com/x', verified: false,
+  }]
+  sendCompany('这家公司近三年的产品发布会都有哪些')
+  await tick(); await tick()
+  tree = render()
+  const req = lastCompanyReq()
+  check('请求带上了股票代码与名称', req.code === '00005', String(req.code))
+  check('数据源由宿主侧读取（请求不再传 tools）', req.tools === undefined, JSON.stringify(req.tools))
+  check('对话里有用户与 AI 两条消息', companyBubbles('user') === 1 && companyBubbles('assistant') === 1,
+    companyBubbles('user') + '/' + companyBubbles('assistant'))
+  check('AI 的说明显示在气泡里', collectText(tree).includes('查到 2026 年 9 月 7 日'))
+  check('提示已自动填入事件', collectText(tree).includes('已自动填入 1 条事件'))
+  check('提示了用了哪个数据源', collectText(tree).includes('mcp__finance__company_events'))
+  const eventDates = collect(tree).filter((n) => n.props['data-astk'] === 'event-date').map((n) => collectText(n))
+  check('事件表里立刻出现这条', eventDates.includes('2026-09-07'), JSON.stringify(eventDates))
+
+  // 第二轮：历史要带上
+  sendCompany('再查一下分红除权日')
+  await tick(); await tick()
+  tree = render()
+  const req2 = lastCompanyReq()
+  check('第二轮带上之前的对话', Array.isArray(req2.history) && req2.history.length === 2, JSON.stringify(req2.history && req2.history.length))
+  check('第二轮仍是同一条对话流', companyBubbles('user') === 2 && companyBubbles('assistant') === 2)
+
+  // 失败：气泡里留痕、输入框内容不丢
+  companyChatError = '模型调用失败：配额不足'
+  sendCompany('再查一次')
+  await tick(); await tick()
+  tree = render()
+  check('查询失败时显示可读错误', collectText(tree).includes('配额不足'))
+  check('失败也在对话里留痕', collect(tree).some((n) => String(n.props.className || '').includes('astk-msg-err')))
+  check('失败后输入框内容不丢', byData('company-input').props.value === '再查一次', byData('company-input').props.value)
+  companyChatError = null
+
+  collect(tree).find((n) => n.props['data-astk'] === 'company-reset').props.onClick()
+  tree = render()
+  check('清空对话后气泡消失', companyBubbles('user') === 0 && companyBubbles('assistant') === 0)
+}
 
 console.log('\n[5e] 回测区间')
 

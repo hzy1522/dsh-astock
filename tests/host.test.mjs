@@ -61,9 +61,16 @@ const services = {
   },
   agentDefaultModel: { currentSelection: () => ({ provider: 'mock-provider', model: 'mock-model' }) },
 }
+// 插件上下文里拿到的 tools 服务就是这样：只有 register / schemas / get，**没有 execute**。
+// 这正是「插件无法调用宿主注册的 MCP 工具」的原因，测试里也照这个形状来。
+const toolsStub = { register: () => {}, schemas: () => [], get: () => undefined }
 const ctx = {
   effect: (callback) => { callback() },
-  get: (name) => (name === 'web' && !webAvailable ? undefined : (name === 'web' ? webStub : services[name])),
+  get: (name) => {
+    if (name === 'web') return webAvailable ? webStub : undefined
+    if (name === 'tools') return toolsStub
+    return services[name]
+  },
   webServer: {
     register: (route) => {
       routes.set(route.path, route.handler)
@@ -105,7 +112,7 @@ console.log('[1] 插件契约')
 check('导出 name', host.name === 'astock', host.name)
 check('导出 inject 含 webServer', Array.isArray(host.inject) && host.inject.includes('webServer'), JSON.stringify(host.inject))
 check('导出 apply 函数', typeof host.apply === 'function')
-check('注册了 10 条路由', routes.size === 10, [...routes.keys()].join(', '))
+check('注册了 12 条路由', routes.size === 12, [...routes.keys()].join(', '))
 
 console.log('\n[2] health 路由')
 {
@@ -713,6 +720,119 @@ console.log('\n[9b4] 事件类需求：宿主先自己查一遍')
   await call('/astock/api/generate-strategy', { body: { description: '双均线金叉买', mode: 'expr', code: '01810', name: '小米集团', history: [] } })
   const plainPrompt = llmCalls[0].messages.map((m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')).join('\n')
   check('非事件需求不加预查块', !plainPrompt.includes('网络检索参考'))
+}
+
+console.log('\n[9b5] 公司数据 AI 对话（联网 + 自定义数据源 + 自动填表）')
+{
+  // 1) 数据源清单：自定义 HTTP 接口的增删改查 + 如实说明为什么不能直接调 MCP
+  await call('/astock/api/data-sources', { body: { items: [] } })
+  const empty = await call('/astock/api/data-sources')
+  check('数据源接口 HTTP 200', empty.status === 200, JSON.stringify(empty.body).slice(0, 100))
+  check('初始为空', Array.isArray(empty.body.items) && empty.body.items.length === 0)
+  check('如实说明插件调不了宿主注册的工具',
+    empty.body.registry.toolsReachable === false && empty.body.registry.reason.includes('没有 execute'),
+    String(empty.body.registry.reason).slice(0, 60))
+
+  const saved = await call('/astock/api/data-sources', {
+    body: {
+      items: [
+        { id: 'cninfo', name: '巨潮公告', description: '查公告', url: 'https://example.com/ann?code={code}', note: '用它查公告原文。' },
+        { id: 'bad', name: '非法', url: 'ftp://nope' },
+      ],
+    },
+  })
+  check('只保存形状合法的数据源', saved.body.items.length === 1 && saved.body.items[0].id === 'cninfo',
+    JSON.stringify(saved.body.items.map((x) => x.id)))
+  check('说明文本保住了', saved.body.items[0].note === '用它查公告原文。')
+  const reread = await call('/astock/api/data-sources')
+  check('读回一致', reread.body.items.length === 1 && reread.body.items[0].url.includes('{code}'))
+
+  // 2) 一轮对话：模型调用自定义数据源 → 输出 events → 宿主自动填进表
+  const round1 = [
+    { type: 'block-start', index: 0, blockType: 'tool-call' },
+    { type: 'tool-call-delta', index: 0, id: 'ds-1', name: 'ds_cninfo', argumentsDelta: '{"code":"01810"}' },
+    { type: 'finish', reason: { kind: 'tool-calls' } },
+  ]
+  const round2 = [
+    {
+      type: 'text-delta',
+      index: 0,
+      text: '查到 2026 年 9 月 7 日有一场新品发布会。\n```events\n'
+        + JSON.stringify([{ date: '2026-09-07', title: '小米秋季旗舰新品发布会', source: 'https://example.com/x', evidence: '9月7日晚举行' }])
+        + '\n```',
+    },
+    { type: 'usage', usage: { inputTokens: 300, outputTokens: 60 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/custom-events', { body: { code: '01810', items: [] } })
+  llmCalls.length = 0
+  llmRounds = [round1, round2]
+  const chat = await call('/astock/api/company-chat', {
+    body: { code: '01810', name: '小米集团', description: '小米今年的产品发布会都有哪些', history: [] },
+  })
+  llmRounds = null
+  check('对话 HTTP 200', chat.status === 200, JSON.stringify(chat.body).slice(0, 120))
+  const toolNames = (llmCalls[0].tools || []).map((t) => t.name)
+  check('把自定义数据源当成工具交给模型', toolNames.includes('ds_cninfo'), JSON.stringify(toolNames))
+  check('联网工具也在', toolNames.includes('web_search') && toolNames.includes('web_fetch'))
+  check('数据源的说明被注入系统提示词', llmCalls[0].system.includes('数据源说明：巨潮公告')
+    && llmCalls[0].system.includes('用它查公告原文'), '')
+  // 结果（成功或失败）都要回给模型，并且要能看出是哪个数据源。
+  const toolFeed = llmCalls[1].messages
+    .flatMap((m) => m.content.filter((c) => c.type === 'tool-result'))
+    .map((c) => String(c.content[0].text))
+  check('工具结果回给了模型并标出数据源',
+    toolFeed.some((text) => text.includes('自定义数据源 巨潮公告')), JSON.stringify(toolFeed).slice(0, 120))
+  check('回报了用到的数据源', chat.body.usedTools.includes('ds_cninfo'), JSON.stringify(chat.body.usedTools))
+  check('解析出候选事件', chat.body.events.length === 1 && chat.body.events[0].date === '2026-09-07', JSON.stringify(chat.body.events))
+
+  // 3) 自动填表
+  check('自动填入 1 条', chat.body.added === 1, String(chat.body.added))
+  const custom = chat.body.payload.events.filter((e) => e.kind === 'custom')
+  check('事件表里出现了这条', custom.length === 1 && custom[0].date === '2026-09-07', JSON.stringify(custom.map((e) => e.date)))
+  check('自动填入的标为未核实', custom[0].verified === false && custom[0].source.includes('未核实'), custom[0].source)
+  check('带上来源链接', custom[0].url === 'https://example.com/x', custom[0].url)
+  check('正文说明里没有 events 区块', !chat.body.reply.includes('```') && chat.body.reply.includes('9 月 7 日'), chat.body.reply)
+
+  // 4) 重复不写重
+  llmRounds = [round2]
+  const again = await call('/astock/api/company-chat', {
+    body: { code: '01810', name: '小米集团', description: '再查一遍', history: [] },
+  })
+  llmRounds = null
+  check('重复查到同一条不会写重', again.body.added === 0, String(again.body.added))
+
+  // 5) 只问情况、不给日期：不该往表里塞东西
+  await call('/astock/api/custom-events', { body: { code: '600519', items: [] } })
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '这家公司最近没有发布新的公告。' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  const askOnly = await call('/astock/api/company-chat', {
+    body: { code: '600519', name: '贵州茅台', description: '最近有什么动态', history: [] },
+  })
+  check('只回答时事件为空', askOnly.body.events.length === 0)
+  check('只回答时不写表', askOnly.body.added === 0, String(askOnly.body.added))
+
+  // 6) 停用的数据源不暴露
+  await call('/astock/api/data-sources', {
+    body: { items: [{ id: 'cninfo', name: '巨潮公告', url: 'https://example.com/ann?code={code}', enabled: false }] },
+  })
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '```events\n[]\n```' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/company-chat', { body: { code: '01810', description: '随便问问', history: [] } })
+  check('停用的数据源不会交给模型', !(llmCalls[0].tools || []).some((t) => t.name === 'ds_cninfo'),
+    JSON.stringify((llmCalls[0].tools || []).map((t) => t.name)))
+  await call('/astock/api/data-sources', { body: { items: [] } })
+  await call('/astock/api/custom-events', { body: { code: '01810', items: [] } })
+
+  const bad = await call('/astock/api/company-chat', { body: { code: 'NOPE', description: 'x' } })
+  check('非法代码返回 500', bad.status === 500 && typeof bad.body.error === 'string', bad.body.error)
+  const noDesc = await call('/astock/api/company-chat', { body: { code: '01810', description: '   ' } })
+  check('没写问题返回 500 + error', noDesc.status === 500 && String(noDesc.body.error).includes('先写一句'), noDesc.body.error)
 }
 
 console.log('\n[9c] 自定义事件（AI 检索结果需用户确认后才生效）')

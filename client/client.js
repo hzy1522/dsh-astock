@@ -105,6 +105,12 @@ window.__ModuleLoader__.load({
       '.astk-msg-ai{align-self:flex-start;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-left:3px solid var(--dsw-alias-brand-primary)}',
       '.astk-msg-err{border-left-color:var(--dsw-alias-label-secondary)}',
       '.astk-msg-m{margin-top:4px;font-size:11.5px;color:var(--dsw-alias-label-secondary)}',
+      // 外部数据源勾选项
+      '.astk-src{display:flex;gap:8px;align-items:baseline;font-size:12px;padding:3px 0;cursor:pointer}',
+      '.astk-src-n{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dsw-alias-label-primary)}',
+      '.astk-src-d{color:var(--dsw-alias-label-secondary)}',
+      '.astk-src-row{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--dsw-alias-border-l2)}',
+      '.astk-src-main{min-width:0;flex:1 1 auto;word-break:break-all}',
     ].join('\n')
 
     // ---------------- 数据访问（HTTP 路由） ----------------
@@ -1383,6 +1389,11 @@ window.__ModuleLoader__.load({
         suggestedEvents: [], eventsBusy: false,
         // 多轮对话：{ role, text（发给模型的历史）, show（气泡里显示）, meta（做了什么） }
         chat: [], chatBusy: false, exprPrev: null, searchNote: '',
+        // 「公司数据」页的 AI 对话：查公司动态、查到就直接填进事件表
+        companyChat: [], companyInput: '', companyBusy: false,
+        sources: null, sourcesError: '',
+        // 新增数据源的草稿
+        srcName: '', srcUrl: '', srcNote: '',
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1482,6 +1493,85 @@ window.__ModuleLoader__.load({
           })
       }
 
+      /** 把界面状态里的数据源还原成可提交的数组（覆盖式保存）。 */
+      function sourceRowsRaw(s) {
+        const items = s.sources && Array.isArray(s.sources.items) ? s.sources.items : []
+        return items.map((item) => ({
+          id: item.id, name: item.name, url: item.url, note: item.note,
+          enabled: item.enabled !== false,
+        }))
+      }
+
+      /** 拉一次「外部数据源」清单：用户配置的 HTTP 接口。 */
+      function loadSources() {
+        api('data-sources')
+          .then((res) => store.set({
+            sources: {
+              items: Array.isArray(res.items) ? res.items : [],
+              webSearch: res.webSearch === true,
+              registry: res.registry || null,
+            },
+            sourcesError: '',
+          }))
+          .catch((error) => store.set({ sources: null, sourcesError: String((error && error.message) || error) }))
+      }
+
+      /** 保存外部数据源清单（整体覆盖）。 */
+      function saveSources(items) {
+        apiPost('data-sources', { items })
+          .then((res) => store.set({
+            sources: Object.assign({}, store.get().sources, { items: Array.isArray(res.items) ? res.items : [] }),
+            sourcesError: '',
+          }))
+          .catch((error) => store.set({ sourcesError: String((error && error.message) || error) }))
+      }
+
+      /**
+       * 公司数据页：和 AI 聊一轮，让它去查这家公司的动态。
+       *
+       * 查到的事件由**宿主直接写进事件表**（标为未核实、可删除），客户端只要把返回的
+       * 最新事件列表铺上去即可——「自动填入」是服务端做的，不存在只填了一半的情况。
+       */
+      async function sendCompanyChat() {
+        const s = store.get()
+        const description = s.companyInput.trim()
+        if (description === '') { store.set({ sourcesError: '先写一句你想查什么，例如「小米今年的产品发布会都有哪些」' }); return }
+        const thread = s.companyChat.concat([{ role: 'user', show: description, text: description }])
+        store.set({ companyChat: thread, companyInput: '', companyBusy: true, sourcesError: '' })
+        try {
+          const res = await apiPost('company-chat', {
+            code: s.selected || '',
+            name: (s.quote && s.quote.name) || '',
+            description,
+            history: s.companyChat.map((m) => ({ role: m.role, text: m.text })),
+          })
+          const added = Number(res.added || 0)
+          const used = Array.isArray(res.usedTools) && res.usedTools.length > 0
+            ? '　用了：' + res.usedTools.join('、')
+            : ''
+          const meta = added > 0
+            ? '已自动填入 ' + added + ' 条事件（标为未核实，可删除）' + used
+            : '没有新的日期需要填入' + used
+          let note = ''
+          if (res.searched) note = '联网查证 ' + String(res.searches || 0) + ' 次' + (res.builtinSearch ? '（内置财经资讯检索）' : '')
+          else if (res.searchError) note = '联网查证失败：' + String(res.searchError).slice(0, 160)
+          const payload = res.payload || null
+          store.set({
+            companyBusy: false,
+            companyChat: thread.concat([{ role: 'assistant', show: String(res.reply || '').trim() || meta, meta, note }]),
+            // 宿主已经写好了，这里照单全收。
+            events: payload && Array.isArray(payload.events) ? payload.events : store.get().events,
+            eventCounts: payload && payload.counts ? payload.counts : store.get().eventCounts,
+            eventsNote: payload ? String(payload.note || '') : store.get().eventsNote,
+          })
+        } catch (error) {
+          store.set({
+            companyBusy: false, companyInput: description,
+            companyChat: thread.concat([{ role: 'assistant', show: '查询失败：' + String((error && error.message) || error), error: true }]),
+          })
+        }
+      }
+
       /** 取该股的真实事件日期（说明会 / 财报预约披露 / 除权除息），供事件因子使用。 */
       function loadEvents(code) {
         store.set({ eventsLoading: true, eventsError: '' })
@@ -1537,6 +1627,8 @@ window.__ModuleLoader__.load({
         store.set({
           selected: code, quote: null, quoteError: '', fins: [], finsError: '',
           events: [], eventsError: '', eventCounts: null, suggestedEvents: [], hover: null, offset: 0, bt: null,
+          // 对话是针对这只股票的，换股票就重开。
+          companyChat: [], companyInput: '',
         })
         loadQuote(code); loadFins(code); loadEvents(code); loadBars()
       }
@@ -2082,6 +2174,9 @@ window.__ModuleLoader__.load({
           return () => { alive = false }
         }, [])
 
+        // 拉一次外部数据源清单（MCP 工具 / skill），公司数据页要用。
+        React.useEffect(() => { loadSources() }, [])
+
         // 拉取免责声明确认状态。失败时保持 null（不弹窗）——页脚的常驻声明
         // 仍然可见，所以不会出现「既没弹窗也看不到声明」的空档。
         React.useEffect(() => {
@@ -2244,6 +2339,110 @@ window.__ModuleLoader__.load({
                   .map((x) => ({ date: x.date, title: x.title, announcedAt: x.announcedAt, source: x.url, addedBy: x.source.includes('手工') ? 'manual' : 'ai' }))),
               }, '✕ 删除')
             : null)))
+          // 「和 AI 一起查公司动态」：查到的事件由宿主直接写进下面的表。
+          // 外部数据源 = 用户配置的 HTTP 接口 + 说明文本（插件无法调用宿主注册的工具，见下方说明）。
+          const sourceRows = (s.sources && Array.isArray(s.sources.items) ? s.sources.items : [])
+            .map((item) => React.createElement('div', { key: 'src-' + item.id, className: 'astk-src-row', 'data-astk': 'src-' + item.id },
+              React.createElement('div', { className: 'astk-src-main' },
+                React.createElement('div', { className: 'astk-src-n' }, item.name + (item.enabled === false ? '（已停用）' : '')),
+                React.createElement('div', { className: 'astk-src-d' }, item.url),
+                item.note ? React.createElement('div', { className: 'astk-src-d' }, '说明：' + item.note.slice(0, 80)) : null),
+              React.createElement('button', {
+                className: 'astk-btn astk-btn-mini',
+                'data-astk': 'src-del-' + item.id,
+                onClick: () => saveSources(sourceRowsRaw(s).filter((x) => x.id !== item.id)),
+              }, '✕')))
+
+          const sourcesBlock = React.createElement('div', { className: 'astk-sec' },
+            React.createElement('h4', null, '外部数据源（可选）'),
+            React.createElement('div', { className: 'astk-note' },
+              '除了联网检索，你还可以接自己的数据接口：填一个 HTTP URL 模板，AI 就能把它当工具调用。'
+              + '模板里支持 {code}（股票代码）、{name}（股票名）、{query}（查询词）。'
+              + '「说明」会原样注入给 AI——把某个 MCP / skill 的用法写在这里，它就知道该怎么用你的数据源。'),
+            sourceRows.length > 0 ? React.createElement('div', null, sourceRows) : null,
+            React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' } },
+              React.createElement('input', {
+                type: 'text', className: 'astk-field-in', placeholder: '名称，如「巨潮公告」',
+                'data-astk': 'src-name', value: s.srcName,
+                onChange: (e) => store.set({ srcName: e.target.value }),
+              }),
+              React.createElement('input', {
+                type: 'text', className: 'astk-field-in', style: { flex: '1 1 260px' },
+                placeholder: 'URL 模板，如 https://api.example.com/ann?code={code}',
+                'data-astk': 'src-url', value: s.srcUrl,
+                onChange: (e) => store.set({ srcUrl: e.target.value }),
+              })),
+            React.createElement('div', { style: { marginTop: '6px' } },
+              React.createElement('input', {
+                type: 'text', className: 'astk-field-in', style: { width: '100%' },
+                placeholder: '说明（可选）：这个接口能查什么、怎么用、返回什么，会原样告诉 AI',
+                'data-astk': 'src-note', value: s.srcNote,
+                onChange: (e) => store.set({ srcNote: e.target.value }),
+              })),
+            React.createElement('div', { style: { marginTop: '8px' } },
+              React.createElement('button', {
+                className: 'astk-btn',
+                'data-astk': 'src-add',
+                onClick: () => {
+                  const draft = store.get()
+                  const name = draft.srcName.trim()
+                  const url = draft.srcUrl.trim()
+                  if (name === '' || !/^https?:\/\//.test(url)) { store.set({ sourcesError: '数据源需要名称与 http(s) 开头的 URL' }); return }
+                  const id = name.toLowerCase().replace(/[^\w.-]+/g, '-').slice(0, 40) || ('src' + Date.now().toString(36))
+                  const items = sourceRowsRaw(store.get()).filter((x) => x.id !== id)
+                  items.push({ id, name, url, note: draft.srcNote.trim(), enabled: true })
+                  saveSources(items)
+                  store.set({ srcName: '', srcUrl: '', srcNote: '', sourcesError: '' })
+                },
+              }, '＋ 添加数据源')),
+            s.sources && s.sources.registry && s.sources.registry.toolsReachable === false
+              ? React.createElement('div', { className: 'astk-warn', 'data-astk': 'registry-note' },
+                  '为什么不直接调用 MCP：' + String(s.sources.registry.reason))
+              : null,
+            s.sourcesError ? React.createElement('div', { className: 'astk-err' }, s.sourcesError) : null)
+
+          const companyBubbles = s.companyChat.map((m, i) => React.createElement('div', {
+            key: 'cm' + i,
+            className: 'astk-msg astk-msg-' + (m.role === 'user' ? 'me' : 'ai') + (m.error ? ' astk-msg-err' : ''),
+            'data-astk': 'company-' + m.role,
+          },
+          React.createElement('div', { className: 'astk-msg-b' }, m.show),
+          m.note ? React.createElement('div', { className: 'astk-msg-m' }, m.note) : null,
+          m.meta ? React.createElement('div', { className: 'astk-msg-m' }, m.meta) : null))
+
+          const companyChatSection = React.createElement('div', { className: 'astk-sec' },
+            React.createElement('h4', null, '和 AI 一起查公司动态'),
+            React.createElement('div', { className: 'astk-note' },
+              '让它去查这家公司的动态——发布会、业绩说明会、股东大会、财报披露、分红除权……'
+              + '它查到的日期会**自动填进下面的表**（标为未核实、带来源链接、可随时删除），策略里用 EVCUS(n) 引用。'),
+            s.companyChat.length === 0
+              ? null
+              : React.createElement('div', { className: 'astk-chat', 'data-astk': 'company-chat-log' }, companyBubbles),
+            React.createElement('textarea', {
+              className: 'astk-ta', rows: 2, value: s.companyInput,
+              'data-astk': 'company-input',
+              placeholder: s.companyChat.length === 0
+                ? '例如：小米近三年的产品发布会都有哪些？／这家公司今年还有哪些股东大会？'
+                : '继续问，例如「再查一下它的分红除权日」',
+              onChange: (e) => store.set({ companyInput: e.target.value }),
+            }),
+            React.createElement('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', marginTop: '8px', flexWrap: 'wrap' } },
+              React.createElement('button', {
+                className: 'astk-btn astk-btn-on',
+                'data-astk': 'company-send',
+                disabled: s.companyBusy,
+                onClick: () => { void sendCompanyChat() },
+              }, s.companyBusy ? '查询中…' : (s.companyChat.length === 0 ? '查询并填入' : '继续查询')),
+              s.companyChat.length > 0
+                ? React.createElement('button', {
+                    className: 'astk-btn',
+                    'data-astk': 'company-reset',
+                    onClick: () => store.set({ companyChat: [] }),
+                  }, '清空对话')
+                : null,
+              React.createElement('span', { className: 'astk-note', style: { padding: 0 } },
+                '查询结果仅供参考：AI 找到的日期没有经过交易所数据核对，表里会标成「未核实」。')))
+
           const eventsSection = React.createElement('div', { className: 'astk-sec' },
             React.createElement('h4', null, '公司动态（真实事件日期）'),
             s.eventsLoading ? React.createElement('div', { className: 'astk-note' }, '加载事件日期中…') : null,
@@ -2318,6 +2517,8 @@ window.__ModuleLoader__.load({
                     React.createElement('th', null, '毛利率(%)'))),
                   React.createElement('tbody', null, rows))
               : (s.finsLoading ? null : React.createElement('div', { className: 'astk-note' }, '暂无财务数据。')),
+            companyChatSection,
+            sourcesBlock,
             eventsSection)
         } else if (s.tab === 'strategy') {
           const tpl = templateById(s.templateId)
