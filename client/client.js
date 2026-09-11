@@ -291,12 +291,17 @@ window.__ModuleLoader__.load({
         for (let i = 0; i < arr.length; i++) if (arr[i] !== null && arr[i] !== undefined) return arr[i]
         throw new Error(label + ' 需要常量参数')
       }
+      /** 情绪因子都依赖大盘指数序列；缺失时给出可操作的提示，而不是算出一堆 null。 */
+      function benchOrThrow() {
+        if (!S.BENCH) throw new Error('市场情绪因子需要大盘指数数据，本次回测未取得，请检查网络后重试')
+        return S.BENCH
+      }
       function ev(node) {
         if (node.k === 'num') return fill(node.v)
         // 已算好的序列：JS 策略把指标结果回传进来时走这条路径。
         if (node.k === 'series') return node.v
         if (node.k === 'var') {
-          const map = { C: S.C, CLOSE: S.C, O: S.O, OPEN: S.O, H: S.H, HIGH: S.H, L: S.L, LOW: S.L, V: S.V, VOL: S.V, VOLUME: S.V }
+          const map = { C: S.C, CLOSE: S.C, O: S.O, OPEN: S.O, H: S.H, HIGH: S.H, L: S.L, LOW: S.L, V: S.V, VOL: S.V, VOLUME: S.V, BENCH: S.BENCH, INDEX: S.BENCH }
           const arr = map[node.name]
           if (arr === undefined) throw new Error('未知变量「' + node.name + '」')
           return arr
@@ -362,6 +367,46 @@ window.__ModuleLoader__.load({
           else if (callName === 'ABS') out = A[0].map((v) => (v === null ? null : Math.abs(v)))
           else if (callName === 'MAX') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.max(v, A[1][i])))
           else if (callName === 'MIN') out = A[0].map((v, i) => (v === null || A[1][i] === null ? null : Math.min(v, A[1][i])))
+          // ---- 市场情绪因子：全部由「个股 + 大盘指数」两组序列算出，完全可回测 ----
+          else if (callName === 'RS' || callName === 'IDXRET' || callName === 'IDXMA' || callName === 'IDXVOL' || callName === 'IDXDEV' || callName === 'BETA') {
+            const B = benchOrThrow()
+            const p = constArg(A[0], callName)
+            out = new Array(n)
+            for (let i = 0; i < n; i++) {
+              if (i < p) { out[i] = null; continue }
+              const bi = B[i]
+              const bj = B[i - p]
+              if (bi === null || bj === null || bj === 0) { out[i] = null; continue }
+              if (callName === 'IDXRET') { out[i] = bi / bj - 1; continue }
+              if (callName === 'IDXMA' || callName === 'IDXDEV') {
+                let sum = 0; let ok = true
+                for (let k = i - p + 1; k <= i; k++) { if (B[k] === null) { ok = false; break } sum += B[k] }
+                const ma = ok ? sum / p : null
+                out[i] = ma === null || ma === 0 ? null : (callName === 'IDXMA' ? ma : bi / ma - 1)
+                continue
+              }
+              if (callName === 'RS') {
+                const ci = S.C[i]; const cj = S.C[i - p]
+                out[i] = (ci === null || cj === null || cj === 0) ? null : (ci / cj) / (bi / bj)
+                continue
+              }
+              // IDXVOL / BETA 都用日收益做滚动统计
+              let sumX = 0; let sumY = 0; let sumXY = 0; let sumXX = 0; let ok = true
+              for (let k = i - p + 1; k <= i; k++) {
+                const bp = B[k - 1]; const cp = S.C[k - 1]
+                if (B[k] === null || bp === null || bp === 0 || S.C[k] === null || cp === null || cp === 0) { ok = false; break }
+                const x = B[k] / bp - 1
+                const y = S.C[k] / cp - 1
+                sumX += x; sumY += y; sumXY += x * y; sumXX += x * x
+              }
+              if (!ok) { out[i] = null; continue }
+              const mx = sumX / p; const my = sumY / p
+              const varX = sumXX / p - mx * mx
+              if (callName === 'BETA') { out[i] = varX === 0 ? null : (sumXY / p - mx * my) / varX; continue }
+              // IDXVOL：指数日收益的年化标准差（x 就是指数收益，varX 即其方差）
+              out[i] = varX <= 0 ? 0 : Math.sqrt(varX) * Math.sqrt(250)
+            }
+          }
           else throw new Error('未知函数「' + callName + '」')
           return out
         }
@@ -370,10 +415,59 @@ window.__ModuleLoader__.load({
       return ev(ast)
     }
 
-    const seriesOf = (bars) => {
+    /**
+     * 把 K 线数组拆成各序列。
+     * @param bars - [date, o, c, h, l, v] 的数组。
+     * @param bench - 与 bars 按日期对齐的指数收盘价序列；为 null 时情绪因子不可用。
+     */
+    const seriesOf = (bars, bench) => {
       const n = bars.length; const C = []; const O = []; const H = []; const L = []; const V = []
       for (let i = 0; i < n; i++) { const b = bars[i]; O.push(b[1]); C.push(b[2]); H.push(b[3]); L.push(b[4]); V.push(b[5]) }
-      return { n, C, O, H, L, V }
+      return { n, C, O, H, L, V, BENCH: bench || null }
+    }
+
+    /**
+     * 把另一组 K 线的收盘价按日期对齐到目标 K 线上。
+     *
+     * 只做**前向填充**（沿用最近一个已知值），开头没有对应交易日的位置保持 null。
+     * 刻意不用未来值回填开头——那会让早期的因子值偷偷用上后面的数据。
+     * @param bars - 目标 K 线。
+     * @param otherBars - 另一组 K 线（如大盘指数）。
+     * @returns 长度与 bars 相同的收盘价序列，或 null（没有可用数据）。
+     */
+    function alignCloses(bars, otherBars) {
+      if (!otherBars || otherBars.length === 0) return null
+      const map = {}
+      for (const b of otherBars) map[b[0]] = b[2]
+      const out = new Array(bars.length)
+      let last = null
+      for (let i = 0; i < bars.length; i++) {
+        const v = map[bars[i][0]]
+        if (v !== undefined && v !== null) last = v
+        out[i] = last
+      }
+      return out.some((v) => v !== null) ? out : null
+    }
+
+    /** 大盘指数 K 线缓存：同一区间内多次回测不重复取数。 */
+    let indexCache = { key: '', bars: null }
+    /**
+     * 取大盘指数日线（市场情绪因子的基础数据）。
+     * @param years - 需要覆盖的年数。
+     * @returns 指数 K 线数组；取不到时返回 null，让情绪因子给出可读错误而不是静默算错。
+     */
+    async function loadIndexBars(years) {
+      const key = 'sh000300|' + years
+      if (indexCache.key === key) return indexCache.bars
+      try {
+        const res = await api('kline', { symbol: 'sh000300', period: 'day', fq: '', years: String(years) })
+        const bars = Array.isArray(res.bars) && res.bars.length > 0 ? res.bars : null
+        indexCache = { key, bars }
+        return bars
+      } catch {
+        indexCache = { key, bars: null }
+        return null
+      }
     }
 
     // ---------------- JavaScript 策略 ----------------
@@ -430,6 +524,13 @@ window.__ModuleLoader__.load({
         AND: (a, b) => bin('&&', a, b),
         OR: (a, b) => bin('||', a, b),
         NOT: (a) => evalAst({ k: 'not', a: jsNode(a) }, S),
+        // 市场情绪因子（都返回与 K 线等长的序列）
+        RS: (n) => call('RS', [n]),
+        IDXRET: (n) => call('IDXRET', [n]),
+        IDXMA: (n) => call('IDXMA', [n]),
+        IDXDEV: (n) => call('IDXDEV', [n]),
+        IDXVOL: (n) => call('IDXVOL', [n]),
+        BETA: (n) => call('BETA', [n]),
       }
     }
 
@@ -438,6 +539,7 @@ window.__ModuleLoader__.load({
       'MA', 'EMA', 'SUM', 'STD', 'HHV', 'LLV', 'REF', 'RSI', 'DIF', 'DEA', 'MACD',
       'BOLL_UP', 'BOLL_MID', 'BOLL_LOW', 'CROSS', 'GT', 'LT', 'GTE', 'LTE', 'AND', 'OR', 'NOT',
       'ABS', 'MAX', 'MIN',
+      'RS', 'IDXRET', 'IDXMA', 'IDXDEV', 'IDXVOL', 'BETA',
     ]
 
     /**
@@ -449,8 +551,8 @@ window.__ModuleLoader__.load({
      */
     function runJsStrategy(source, S) {
       const lib = buildJsLib(S)
-      const head = ['C', 'O', 'H', 'L', 'V', 'N'].concat(JS_PARAMS)
-      const args = [S.C, S.O, S.H, S.L, S.V, S.n].concat(JS_PARAMS.map((k) => lib[k]))
+      const head = ['C', 'O', 'H', 'L', 'V', 'N', 'BENCH'].concat(JS_PARAMS)
+      const args = [S.C, S.O, S.H, S.L, S.V, S.n, S.BENCH].concat(JS_PARAMS.map((k) => lib[k]))
       let fn
       try {
         // eslint-disable-next-line no-new-func -- 用户自写策略的执行方式
@@ -483,13 +585,20 @@ window.__ModuleLoader__.load({
       '//   MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)',
       '//   RSI(n) DIF() DEA() MACD() BOLL_UP(p,k) BOLL_MID(p) BOLL_LOW(p,k)',
       '//   CROSS(a,b) GT(a,b) LT(a,b) GTE(a,b) LTE(a,b) AND(a,b) OR(a,b) NOT(a)',
+      '//   --- 市场情绪因子（依赖沪深300，完全可回测）---',
+      '//   BENCH          沪深300 收盘价序列（已按日期对齐）',
+      '//   RS(n)          相对强弱 = 个股 n 日涨幅 ÷ 指数同期涨幅，>1 跑赢大盘',
+      '//   IDXRET(n)      指数 n 日涨幅    IDXMA(n) 指数均线    IDXDEV(n) 指数偏离均线',
+      '//   IDXVOL(n)      指数年化波动率  BETA(n)  个股对指数的滚动 Beta',
       '// 必须 return { buy, sell }，两个数组长度都要等于 C.length。',
-      '// 例：放量金叉才买，死叉或跌破长均线就卖。',
+      '// 例：大盘在均线上方、且个股跑赢大盘时才买。',
+      'const marketUp = GT(BENCH, IDXMA(60))',
+      'const strong = GT(RS(20), 1)',
+      'const volUp = GT(V, MA(V, 20))',
       'const fast = MA(C, 5)',
       'const slow = MA(C, 20)',
-      'const volUp = GT(V, MA(V, 20))',
       'return {',
-      '  buy: AND(CROSS(fast, slow), volUp),',
+      '  buy: AND(AND(CROSS(fast, slow), volUp), AND(marketUp, strong)),',
       '  sell: OR(CROSS(slow, fast), LT(C, slow)),',
       '}',
     ].join('\n')
@@ -573,6 +682,36 @@ window.__ModuleLoader__.load({
           'return {',
           '  buy: AND(GT(fast, mid), GT(mid, slow)),',
           '  sell: LT(C, slow),',
+          '}',
+        ].join('\n'),
+      },
+      {
+        id: 'rs', name: '相对强弱 RS 择时',
+        params: [['n', 'RS 周期', 20], ['th', '强弱阈值', 1]],
+        buy: (p) => 'RS(' + p.n + ')>' + p.th,
+        sell: (p) => 'RS(' + p.n + ')<' + p.th,
+        js: (p) => [
+          '// RS = 个股 N 日涨幅 ÷ 沪深300 同期涨幅，>1 表示跑赢大盘',
+          'const rs = RS(' + p.n + ')',
+          'return {',
+          '  buy: GT(rs, ' + p.th + '),',
+          '  sell: LT(rs, ' + p.th + '),',
+          '}',
+        ].join('\n'),
+      },
+      {
+        id: 'mood', name: '大盘趋势 + 相对强弱',
+        params: [['n', '趋势周期', 60], ['rsn', 'RS 周期', 20]],
+        buy: (p) => 'C>MA(' + p.n + ') AND BENCH>IDXMA(' + p.n + ') AND RS(' + p.rsn + ')>1',
+        sell: (p) => 'C<MA(' + p.n + ') OR BENCH<IDXMA(' + p.n + ')',
+        js: (p) => [
+          '// 只有「个股与大盘都在上升趋势、且个股跑赢大盘」时才买',
+          'const stockUp = GT(C, MA(C, ' + p.n + '))',
+          'const marketUp = GT(BENCH, IDXMA(' + p.n + '))',
+          'const strong = GT(RS(' + p.rsn + '), 1)',
+          'return {',
+          '  buy: AND(AND(stockUp, marketUp), strong),',
+          '  sell: OR(LT(C, MA(C, ' + p.n + ')), LT(BENCH, IDXMA(' + p.n + '))),',
           '}',
         ].join('\n'),
       },
@@ -741,16 +880,8 @@ window.__ModuleLoader__.load({
     }
 
     function alignBenchmark(bars, benchBars) {
-      if (!benchBars || benchBars.length === 0) return null
-      const map = {}
-      for (const b of benchBars) map[b[0]] = b[2]
-      const raw = new Array(bars.length)
-      let last = null
-      for (let i = 0; i < bars.length; i++) {
-        const v = map[bars[i][0]]
-        if (v !== undefined && v !== null) last = v
-        raw[i] = last
-      }
+      const raw = alignCloses(bars, benchBars)
+      if (raw === null) return null
       let first = null
       for (const v of raw) if (v !== null) { first = v; break }
       if (first === null || first === 0) return null
@@ -775,7 +906,7 @@ window.__ModuleLoader__.load({
       const store = createStore({
         watchlist: [], selected: null, tab: 'kline',
         period: 'day', fq: 'qfq', years: 3,
-        bars: [], seriesKey: '', barsLoading: false, barsError: '', source: '',
+        bars: [], seriesKey: '', barsLoading: false, barsError: '', source: '', indexBars: null,
         quote: null, quoteError: '',
         fins: [], finsError: '', finsLoading: false,
         span: 250, offset: 0, hover: null,
@@ -838,11 +969,17 @@ window.__ModuleLoader__.load({
         store.set({ barsLoading: true, barsError: '', seriesKey: key, bt: null })
         api('kline', { code: state.selected, period: state.period, fq: state.fq, years: String(state.years) })
           .then((res) => {
-            if (store.get().seriesKey !== key) return
+            if (store.get().seriesKey !== key) return undefined
             store.set({
               bars: Array.isArray(res.bars) ? res.bars : [],
               barsLoading: false, source: String(res.source || ''), offset: 0, hover: null,
             })
+            // 顺手把大盘指数也取来，供情绪因子读数与回测共用（有缓存，不会重复请求）。
+            return loadIndexBars(store.get().years)
+          })
+          .then((indexBars) => {
+            if (indexBars === undefined || store.get().seriesKey !== key) return
+            store.set({ indexBars })
           })
           .catch((error) => {
             if (store.get().seriesKey !== key) return
@@ -1017,10 +1154,15 @@ window.__ModuleLoader__.load({
           return
         }
         store.set({ btRunning: true, bt: null })
+        // 情绪因子需要大盘指数，所以必须先取到指数再构建策略序列——而不是等
+        // 引擎跑完才为资金曲线去拿。用缓存避免同一区间内反复回测时重复取数。
+        void (async () => {
+        const benchBars = await loadIndexBars(s.years)
+        const bench = alignCloses(bars, benchBars)
         let buySeries = null
         let sellSeries = null
         try {
-          const S = seriesOf(bars)
+          const S = seriesOf(bars, bench)
           if (s.strategyMode === 'js') {
             const signals = runJsStrategy(s.jsSource, S)
             buySeries = signals.buy
@@ -1067,15 +1209,16 @@ window.__ModuleLoader__.load({
           hints.push('起始日 ' + from + ' 早于已加载的最早数据 ' + allBars[0][0] + '，该段未参与回测；需要更早数据请到「K线」页把年数调大。')
         }
         const payload = {
-          metrics, equity: result.equity, trades: result.trades, bench: null, capital: s.capital,
+          metrics, equity: result.equity, trades: result.trades,
+          // 资金曲线的基准直接用已经取到的指数，不再重复请求一次。
+          bench: alignBenchmark(bars, benchBars),
+          capital: s.capital,
           error: '', hints, market: profile.id, currency: profile.unit,
           firstDate: bars[0][0], lastDate: bars[bars.length - 1][0], loadedBars: allBars.length,
+          sentiment: bench !== null,
         }
-        store.set({ tab: 'backtest' })
-        api('kline', { symbol: 'sh000300', period: 'day', fq: '', years: String(s.years) })
-          .then((res) => { payload.bench = alignBenchmark(bars, res && res.bars) })
-          .catch(() => {})
-          .then(() => { store.set({ btRunning: false, bt: payload }) })
+        store.set({ tab: 'backtest', btRunning: false, bt: payload })
+        })()
       }
 
       function CandleChart(props) {
@@ -1385,6 +1528,45 @@ window.__ModuleLoader__.load({
           const tpl = templateById(s.templateId)
           // 当前标的所属市场 —— 决定 T+1/T+0、涨跌停、费率与每手股数。
           const activeProfile = marketProfile(s.selected)
+          // 当前情绪因子读数（取最新一根有值的）。这既是给用户看的「市场情绪」，
+          // 也让因子的正确性可以被测试直接断言——否则只能测「能跑」而测不出「算得对」。
+          const factorRows = (() => {
+            if (!s.bars || s.bars.length < 30 || !s.indexBars) return null
+            const bench = alignCloses(s.bars, s.indexBars)
+            if (bench === null) return null
+            try {
+              const S = seriesOf(s.bars, bench)
+              const latest = (expr) => {
+                const series = evalAst(parseSource(expr), S)
+                for (let i = series.length - 1; i >= 0; i--) {
+                  if (series[i] !== null && series[i] !== undefined) return series[i]
+                }
+                return null
+              }
+              return [
+                { key: 'rs', label: '相对强弱 RS(20)', text: fmt(latest('RS(20)'), 3), note: '>1 表示跑赢沪深300' },
+                { key: 'idxret', label: '指数 20 日涨幅', text: fmtPct(latest('IDXRET(20)')), note: '沪深300 区间涨幅' },
+                { key: 'idxdev', label: '指数偏离 60 日线', text: fmtPct(latest('IDXDEV(60)')), note: '正=在均线上方，偏多' },
+                { key: 'idxvol', label: '指数年化波动率', text: fmtPct(latest('IDXVOL(20)')), note: '越高越不安全' },
+                { key: 'beta', label: 'Beta(60)', text: fmt(latest('BETA(60)'), 2), note: '>1 比大盘波动更大' },
+              ]
+            } catch { return null }
+          })()
+          const factorSection = factorRows === null
+            ? React.createElement('div', { className: 'astk-sec' },
+                React.createElement('h4', null, '市场情绪因子'),
+                React.createElement('div', { className: 'astk-note' },
+                  s.indexBars ? '当前数据不足以计算情绪因子（需要至少 30 根 K 线与对应的大盘指数）。'
+                    : '未取到大盘指数（沪深300），情绪因子暂不可用。'))
+            : React.createElement('div', { className: 'astk-sec' },
+                React.createElement('h4', null, '市场情绪因子（截至最后一根 K 线，全部可回测）'),
+                React.createElement('div', { className: 'astk-grid' },
+                  factorRows.map((row) => React.createElement('div', { key: row.key, className: 'astk-metric' },
+                    React.createElement('b', { 'data-astk': 'factor-' + row.key }, row.text),
+                    React.createElement('span', null, row.label),
+                    React.createElement('span', null, row.note)))),
+                React.createElement('div', { className: 'astk-note' },
+                  '这些因子已接入策略：表达式与 JS 两种模式都可用 BENCH / RS(n) / IDXRET(n) / IDXMA(n) / IDXDEV(n) / IDXVOL(n) / BETA(n)。'))
           const tplButtons = TEMPLATES.map((t) => React.createElement('button', {
             key: t.id,
             className: 'astk-btn' + (s.templateId === t.id ? ' astk-btn-on' : ''),
@@ -1417,7 +1599,8 @@ window.__ModuleLoader__.load({
                   onChange: (e) => store.set({ jsSource: e.target.value }),
                 }),
                 React.createElement('div', { className: 'astk-note' },
-                  '可用（都是与 K 线等长的数组，索引可直接用）：C O H L V；MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)；RSI(n) DIF() DEA() MACD() BOLL_UP(p,k) BOLL_MID(p) BOLL_LOW(p,k)；CROSS(a,b) GT LT GTE LTE AND OR NOT，以及 ABS/MAX/MIN。'),
+                  '可用（都是与 K 线等长的数组，索引可直接用）：C O H L V；MA(x,n) EMA(x,n) SUM(x,n) STD(x,n) HHV(x,n) LLV(x,n) REF(x,n)；RSI(n) DIF() DEA() MACD() BOLL_UP(p,k) BOLL_MID(p) BOLL_LOW(p,k)；CROSS(a,b) GT LT GTE LTE AND OR NOT；ABS/MAX/MIN。'
+                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH 指数序列、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'),
                 React.createElement('div', { className: 'astk-note' },
                   '必须 return { buy, sell }，两个数组长度都要等于 C.length。可以写任意 JS：循环、变量、多条件分支、自定义中间量。'),
                 React.createElement('div', { className: 'astk-warn' },
@@ -1436,7 +1619,8 @@ window.__ModuleLoader__.load({
                   onChange: (e) => store.set({ sellExpr: e.target.value }),
                 }),
                 React.createElement('div', { className: 'astk-note' },
-                  '可用：C O H L V（收/开/高/低/量）、MA(n) EMA(n) SUM(n) STD(n)、RSI(n)、DIF() DEA() MACD()、BOLL_UP(n,k) BOLL_MID(n) BOLL_LOW(n,k)、HHV(n) LLV(n) REF(x,n) CROSS(a,b)、ABS/MAX/MIN，以及 + - * / > < >= <= == != AND OR NOT 与括号。'),
+                  '可用：C O H L V（收/开/高/低/量）、MA(n) EMA(n) SUM(n) STD(n)、RSI(n)、DIF() DEA() MACD()、BOLL_UP(n,k) BOLL_MID(n) BOLL_LOW(n,k)、HHV(n) LLV(n) REF(x,n) CROSS(a,b)、ABS/MAX/MIN，以及 + - * / > < >= <= == != AND OR NOT 与括号。'
+                + ' 市场情绪因子（依赖沪深300，可回测）：BENCH（指数序列）、RS(n) 相对强弱、IDXRET(n) 指数涨幅、IDXMA(n) 指数均线、IDXDEV(n) 偏离均线、IDXVOL(n) 年化波动率、BETA(n) 滚动 Beta。'),
                 React.createElement('div', { className: 'astk-note' },
                   '说明：信号在收盘产生、次日开盘成交（无未来函数）；买入当日不可卖出（T+1）。需要循环或多分支时切到 JavaScript 模式。'))
 
@@ -1501,6 +1685,7 @@ window.__ModuleLoader__.load({
 
           content = React.createElement('div', null,
             rangeSection,
+            factorSection,
             aiSection,
             React.createElement('div', { className: 'astk-sec' },
               React.createElement('h4', null, '策略方式'),

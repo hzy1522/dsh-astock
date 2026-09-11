@@ -83,6 +83,15 @@ const FIXTURES = {
   financials: { rows: [{ date: '2026-06-30', eps: 35.57, bps: 200.99, roe: 16.75, gross: 89.56 }] },
   kline: { source: 'tencent', bars },
 }
+// 独立的沪深300 序列。必须是**另一条**曲线：如果指数等于个股自身，
+// RS 恒等于 1、BETA 恒等于 1，情绪因子就测不出任何东西。
+// 用「缓慢上行 + 正弦扰动」构造，保证收益非零且方差非零。
+const INDEX_BARS = bars.map((b, i) => {
+  const mid = 3500 + i * 1.1 + Math.sin(i / 5) * 30
+  return [b[0], mid - 5, mid, mid + 6, mid - 6, 1.2e8]
+})
+// 让测试可以模拟「指数取不到」的情况
+let indexAvailable = true
 // AI 生成接口的响应可被测试改写，用来验证成功与失败两条路径。
 let generateFixture = {
   code: 'const fast = MA(C, 10)\nconst slow = MA(C, 30)\nreturn { buy: CROSS(fast, slow), sell: CROSS(slow, fast) }',
@@ -124,6 +133,14 @@ globalThis.fetch = async (url, init) => {
     const quote = QUOTES[code]
     if (quote === undefined) return { ok: false, status: 404, json: async () => ({ error: 'no quote for ' + code }) }
     return { ok: true, status: 200, json: async () => quote }
+  }
+  if (key === 'kline') {
+    const symbol = new URLSearchParams(search || '').get('symbol')
+    if (symbol === 'sh000300') {
+      if (!indexAvailable) return { ok: false, status: 500, json: async () => ({ error: '指数取数失败' }) }
+      return { ok: true, status: 200, json: async () => ({ source: 'stub', symbol: 'sh000300', bars: INDEX_BARS }) }
+    }
+    return { ok: true, status: 200, json: async () => FIXTURES.kline }
   }
   const data = FIXTURES[key]
   if (data === undefined) return { ok: false, status: 404, json: async () => ({ error: 'no fixture for ' + raw }) }
@@ -576,6 +593,91 @@ tree = render()
 check('确认失败时弹窗保留', hasGate())
 check('确认失败时给出提示', collectText(tree).includes('免责声明确认未保存'), (collectText(tree).match(/免责声明确认未保存[^。]{0,30}/) || ['无提示'])[0])
 disclaimerAcceptFails = false
+
+console.log('\n[5g] 市场情绪因子')
+
+// 干净重挂载并确保选中 A 股（前面的用例改过状态）
+disclaimerAccepted = true
+indexAvailable = true
+hookState.length = 0
+hookIndex = 0
+tree = render()
+await tick(); await tick(); await tick(); await tick()
+tree = render()
+
+click('策略配置')
+const factorText = collectText(tree)
+check('策略页有情绪因子面板', factorText.includes('市场情绪因子'))
+check('因子面板给出了数值（不是「不可用」）', byData('factor-rs') !== undefined, factorText.includes('未取到大盘指数') ? '面板显示指数不可用' : '')
+check('有两个用情绪因子的模板',
+  findButton(tree, '相对强弱 RS 择时') !== undefined && findButton(tree, '大盘趋势 + 相对强弱') !== undefined)
+
+// ---- 正确性：用 fixture 独立算一遍，和界面显示的比对 ----
+// 面板取的是「最后一个非空值」，fixture 里就是最后一根。
+const last = bars.length - 1
+const benchClose = INDEX_BARS.map((b) => b[2])
+const expectRs = (bars[last][2] / bars[last - 20][2]) / (benchClose[last] / benchClose[last - 20])
+const shownRs = byData('factor-rs').props.children
+check('RS(20) 与手算一致',
+  Math.abs(Number(shownRs) - expectRs) < 5e-4,
+  '显示 ' + shownRs + ' vs 手算 ' + expectRs.toFixed(3))
+
+const expectIdxret = benchClose[last] / benchClose[last - 20] - 1
+const shownIdxret = Number(String(byData('factor-idxret').props.children).replace('%', '')) / 100
+check('IDXRET(20) 与手算一致',
+  Math.abs(shownIdxret - expectIdxret) < 5e-5,
+  '显示 ' + shownIdxret.toFixed(4) + ' vs 手算 ' + expectIdxret.toFixed(4))
+
+// 指数偏离均线：正负号必须和「指数相对 60 日均线」一致
+let ma60 = 0
+for (let i = last - 59; i <= last; i++) ma60 += benchClose[i]
+ma60 /= 60
+const expectIdxdev = benchClose[last] / ma60 - 1
+const shownIdxdev = Number(String(byData('factor-idxdev').props.children).replace('%', '')) / 100
+check('IDXDEV(60) 与手算一致',
+  Math.abs(shownIdxdev - expectIdxdev) < 5e-5,
+  '显示 ' + shownIdxdev.toFixed(4) + ' vs 手算 ' + expectIdxdev.toFixed(4))
+
+// ---- 因子真的能用进策略，并产生交易 ----
+// 切到 JS 模式（前面的用例可能停在表达式模式），再写入策略
+const useJs = (code) => {
+  click('策略配置')
+  if (byData('js-source') === undefined) {
+    findButton(tree, 'JavaScript').props.onClick()
+    tree = render()
+  }
+  setField('js-source', code)
+}
+useJs([
+  '// RS 恒为正，所以这个条件等价于「大盘没暴跌」，用来验证因子能参与信号',
+  'const rs = RS(20)',
+  'const fast = MA(C, 5)',
+  'const slow = MA(C, 20)',
+  'return {',
+  '  buy: AND(CROSS(fast, slow), GT(rs, 0)),',
+  '  sell: CROSS(slow, fast),',
+  '}',
+].join('\n'))
+const rsRun = await runBacktestNow()
+check('用 RS 的策略能跑通', !rsRun.includes('错误'), (rsRun.match(/JS 策略错误[^]{0,40}/) || [''])[0])
+const rsTrades = (rsRun.match(/(\d+)交易次数/) || [])[1]
+check('RS 条件参与后仍产生真实交易', rsTrades !== undefined && Number(rsTrades) > 0, rsTrades + ' 笔')
+
+// ---- 指数取不到时，必须给可读错误而不是静默算错 ----
+// 必须让 years 变成一个**从未取过**的值，否则指数缓存会直接命中：
+// 区间档位只把 years 往大调，所以改走「K线」页的年数按钮设成 5 年。
+indexAvailable = false
+click('K线')
+findButton(tree, '5年').props.onClick()
+tree = render()
+await tick(); await tick(); await tick()
+tree = render()
+useJs('return { buy: GT(RS(20), 0), sell: LT(RS(20), 0) }')
+const noIndex = await runBacktestNow()
+check('指数不可用时给出可读错误',
+  noIndex.includes('市场情绪因子需要大盘指数'),
+  (noIndex.match(/JS 策略错误[^]{0,70}/) || ['无错误信息'])[0])
+indexAvailable = true
 
 console.log('\n[6] 图标组件')
 const icon = iconReg.component({ size: 20, active: true })
