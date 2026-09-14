@@ -1394,6 +1394,8 @@ window.__ModuleLoader__.load({
         sources: null, sourcesError: '',
         // 新增数据源的草稿
         srcName: '', srcUrl: '', srcNote: '',
+        // 同花顺官方数据（REST API，同一个 Key 也支持 MCP）
+        ths: null, thsKeyDraft: '', thsBusy: false, thsNote: '',
         span: 250, offset: 0, hover: null,
         menu: null, menuItems: [], note: '',
         templateId: firstTpl.id, params: defaultParams(firstTpl),
@@ -1514,6 +1516,29 @@ window.__ModuleLoader__.load({
             sourcesError: '',
           }))
           .catch((error) => store.set({ sources: null, sourcesError: String((error && error.message) || error) }))
+      }
+
+      /** 读一次同花顺 Key 状态。 */
+      function loadHithink() {
+        api('hithink')
+          .then((res) => store.set({ ths: res, thsNote: '' }))
+          .catch((error) => store.set({ ths: null, thsNote: String((error && error.message) || error) }))
+      }
+
+      /** 保存或清除同花顺 Key。 */
+      function saveHithink(key) {
+        store.set({ thsBusy: true })
+        apiPost('hithink', { key })
+          .then((res) => store.set({ ths: res, thsKeyDraft: '', thsBusy: false, thsNote: key === '' ? '已清除同花顺 API Key' : '已保存同花顺 API Key' }))
+          .catch((error) => store.set({ thsBusy: false, thsNote: '保存失败：' + String((error && error.message) || error) }))
+      }
+
+      /** 测一次同花顺连通性（拉交易日历）。 */
+      function testHithink() {
+        store.set({ thsBusy: true, thsNote: '正在测试…' })
+        api('hithink/test')
+          .then((res) => store.set({ thsBusy: false, thsNote: (res.ok ? '✓ ' : '✗ ') + String(res.message || '') }))
+          .catch((error) => store.set({ thsBusy: false, thsNote: '测试失败：' + String((error && error.message) || error) }))
       }
 
       /** 保存外部数据源清单（整体覆盖）。 */
@@ -2174,8 +2199,8 @@ window.__ModuleLoader__.load({
           return () => { alive = false }
         }, [])
 
-        // 拉一次外部数据源清单（MCP 工具 / skill），公司数据页要用。
-        React.useEffect(() => { loadSources() }, [])
+        // 拉一次外部数据源清单与同花顺 Key 状态，公司数据页要用。
+        React.useEffect(() => { loadSources(); loadHithink() }, [])
 
         // 拉取免责声明确认状态。失败时保持 null（不弹窗）——页脚的常驻声明
         // 仍然可见，所以不会出现「既没弹窗也看不到声明」的空档。
@@ -2353,6 +2378,45 @@ window.__ModuleLoader__.load({
                 onClick: () => saveSources(sourceRowsRaw(s).filter((x) => x.id !== item.id)),
               }, '✕')))
 
+          const thsBlock = React.createElement('div', { className: 'astk-sec' },
+            React.createElement('h4', null, '同花顺官方数据（可选）'),
+            React.createElement('div', { className: 'astk-note' },
+              '同花顺官方提供了 MCP 与 REST 两套入口、共用同一个 API Key。插件这边走 **REST**'
+              + '（插件上下文无法执行宿主注册的 MCP 工具）。配好 Key 之后，A股行情 / 财务 / 除权除息 /'
+              + '热榜 / 龙虎榜会作为工具交给上面的 AI 助手，除权除息还会在东方财富缺数据时兜底。'
+              + '港股不在其当前覆盖范围。'),
+            s.ths === null
+              ? React.createElement('div', { className: 'astk-note' }, '正在读取状态…')
+              : React.createElement('div', null,
+                  React.createElement('div', { className: 'astk-note', 'data-astk': 'ths-status' },
+                    s.ths.configured
+                      ? '已配置：' + s.ths.keyMasked
+                      : '未配置 API Key'),
+                  React.createElement('div', { style: { display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center', marginTop: '6px' } },
+                    React.createElement('input', {
+                      type: 'password', className: 'astk-field-in', style: { flex: '1 1 240px' },
+                      placeholder: '粘贴同花顺 API Key', 'data-astk': 'ths-key',
+                      value: s.thsKeyDraft, onChange: (e) => store.set({ thsKeyDraft: e.target.value }),
+                    }),
+                    React.createElement('button', {
+                      className: 'astk-btn astk-btn-on', 'data-astk': 'ths-save', disabled: s.thsBusy,
+                      onClick: () => saveHithink(store.get().thsKeyDraft.trim()),
+                    }, '保存'),
+                    s.ths.configured
+                      ? React.createElement('button', {
+                          className: 'astk-btn', 'data-astk': 'ths-clear', disabled: s.thsBusy,
+                          onClick: () => saveHithink(''),
+                        }, '清除')
+                      : null,
+                    React.createElement('button', {
+                      className: 'astk-btn', 'data-astk': 'ths-test', disabled: s.thsBusy || !s.ths.configured,
+                      onClick: () => testHithink(),
+                    }, '测试连接')),
+                  React.createElement('div', { className: 'astk-note' },
+                    'Key 在 ', React.createElement('a', { href: s.ths.adminUrl, target: '_blank', rel: 'noreferrer' }, 'fuyao.aicubes.cn/admin'),
+                    ' 免费签发；官方 MCP 端点是 ', String((s.ths.mcp || [])[0] || ''), '（同一个 Key）。')),
+            s.thsNote ? React.createElement('div', { className: 'astk-warn', 'data-astk': 'ths-note' }, s.thsNote) : null)
+
           const sourcesBlock = React.createElement('div', { className: 'astk-sec' },
             React.createElement('h4', null, '外部数据源（可选）'),
             React.createElement('div', { className: 'astk-note' },
@@ -2518,6 +2582,7 @@ window.__ModuleLoader__.load({
                   React.createElement('tbody', null, rows))
               : (s.finsLoading ? null : React.createElement('div', { className: 'astk-note' }, '暂无财务数据。')),
             companyChatSection,
+            thsBlock,
             sourcesBlock,
             eventsSection)
         } else if (s.tab === 'strategy') {

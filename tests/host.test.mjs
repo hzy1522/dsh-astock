@@ -112,7 +112,7 @@ console.log('[1] 插件契约')
 check('导出 name', host.name === 'astock', host.name)
 check('导出 inject 含 webServer', Array.isArray(host.inject) && host.inject.includes('webServer'), JSON.stringify(host.inject))
 check('导出 apply 函数', typeof host.apply === 'function')
-check('注册了 12 条路由', routes.size === 12, [...routes.keys()].join(', '))
+check('注册了 14 条路由', routes.size === 14, [...routes.keys()].join(', '))
 
 console.log('\n[2] health 路由')
 {
@@ -720,6 +720,65 @@ console.log('\n[9b4] 事件类需求：宿主先自己查一遍')
   await call('/astock/api/generate-strategy', { body: { description: '双均线金叉买', mode: 'expr', code: '01810', name: '小米集团', history: [] } })
   const plainPrompt = llmCalls[0].messages.map((m) => m.content.filter((c) => c.type === 'text').map((c) => c.text).join('')).join('\n')
   check('非事件需求不加预查块', !plainPrompt.includes('网络检索参考'))
+}
+
+console.log('\n[9b6] 同花顺官方数据（REST，同一个 Key 也支持 MCP）')
+{
+  const { thsCode, hithinkTools, maskKey } = host.__test
+  // 代码 → thscode：官方只接受带交易所后缀的完整代码
+  check('沪市后缀', thsCode('600519') === '600519.SH', String(thsCode('600519')))
+  check('深市后缀', thsCode('000001') === '000001.SZ' && thsCode('300750') === '300750.SZ')
+  check('北交所后缀', thsCode('830799') === '830799.BJ')
+  check('港股不在覆盖范围', thsCode('00700') === null && thsCode('60051') === null)
+
+  const status0 = await call('/astock/api/hithink')
+  check('接口返回 Key 状态', status0.status === 200 && status0.body.configured === false, JSON.stringify(status0.body).slice(0, 80))
+  check('给出官方 MCP 端点与后台地址',
+    status0.body.mcp.length === 3 && status0.body.adminUrl.includes('fuyao.aicubes.cn'), JSON.stringify(status0.body.mcp))
+  check('说明了插件侧走 REST 的原因', String(status0.body.note).includes('MCP'))
+
+  // 没配 Key 时：同花顺工具不该出现在对话里
+  await call('/astock/api/data-sources', { body: { items: [] } })
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '```events\n[]\n```' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/company-chat', { body: { code: '600519', description: '随便问问', history: [] } })
+  check('没配 Key 时不暴露同花顺工具', !(llmCalls[0].tools || []).some((t) => t.name.startsWith('ths_')),
+    JSON.stringify((llmCalls[0].tools || []).map((t) => t.name)))
+
+  // 保存一个 Key（假的）：掩码回显、工具出现、测试接口如实报错
+  const saved = await call('/astock/api/hithink', { body: { key: 'abcd1234efgh5678' } })
+  check('保存后标记为已配置', saved.body.configured === true && saved.body.keyMasked === 'abcd****5678', JSON.stringify(saved.body.keyMasked))
+  check('掩码不会泄露完整 Key', !String(saved.body.keyMasked).includes('1234efgh'))
+
+  llmCalls.length = 0
+  llmChunks = [
+    { type: 'text-delta', index: 0, text: '```events\n[]\n```' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  await call('/astock/api/company-chat', { body: { code: '600519', description: '查一下除权除息', history: [] } })
+  const toolNames = (llmCalls[0].tools || []).map((t) => t.name)
+  check('配了 Key 后同花顺工具交给模型', toolNames.includes('ths_corporate_actions') && toolNames.includes('ths_hot_stocks'),
+    JSON.stringify(toolNames))
+  check('系统提示说明了同花顺数据', llmCalls[0].system.includes('同花顺官方数据'))
+
+  // 连通性测试：假 Key 要如实报「Key 无效」，而不是假装成功
+  const test = await call('/astock/api/hithink/test')
+  check('测试接口返回结果', typeof test.body.ok === 'boolean' && typeof test.body.message === 'string', test.body.message)
+  check('假 Key 会被如实拒绝',
+    test.body.ok === false && /API key|2003|code/i.test(test.body.message), test.body.message)
+
+  check('工具清单形状正确',
+    hithinkTools().every((t) => t.name.startsWith('ths_') && typeof t.description === 'string' && t.parameters.type === 'object'),
+    JSON.stringify(hithinkTools().map((t) => t.name)))
+
+  // 清空 Key
+  const cleared = await call('/astock/api/hithink', { body: { key: '' } })
+  check('清空后回到未配置', cleared.body.configured === false && cleared.body.keyMasked === '')
+  check('掩码函数对空串返回空', maskKey('') === '')
+  check('未配置时工具清单为空', hithinkTools().length === 4)
 }
 
 console.log('\n[9b5] 公司数据 AI 对话（联网 + 自定义数据源 + 自动填表）')

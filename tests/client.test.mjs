@@ -119,6 +119,7 @@ let customEvents = []
 let eventsAvailable = true
 // 公司数据 AI 对话的响应可被测试改写。
 let companyChatError = null
+let thsConfigured = false
 // 自定义数据源（内存版）
 let dataSources = [{ id: 'cninfo', name: '巨潮公告', url: 'https://api.example.com/ann?code={code}', note: '用它查公告原文。', enabled: true }]
 let companyChatReply = {
@@ -184,6 +185,26 @@ globalThis.fetch = async (url, init) => {
         registry: { toolsReachable: false, reason: '插件上下文里的 tools 服务只有 register/schemas/get，没有 execute。' },
       }),
     }
+  }
+  if (key === 'hithink') {
+    if (init !== undefined && init.method === 'POST') {
+      const payload = JSON.parse(String(init.body || '{}'))
+      thsConfigured = String(payload.key || '').trim() !== ''
+    }
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        configured: thsConfigured,
+        keyMasked: thsConfigured ? 'abcd****5678' : '',
+        mcp: ['https://fuyao.aicubes.cn/mcp/a-share'],
+        adminUrl: 'https://fuyao.aicubes.cn/admin/',
+        docsUrl: 'https://fuyao.aicubes.cn/docs/',
+        note: '插件侧走 REST。',
+      }),
+    }
+  }
+  if (key === 'hithink/test') {
+    return { ok: true, status: 200, json: async () => ({ ok: thsConfigured, message: thsConfigured ? '连接正常，取到近一年 244 个交易日' : '同花顺接口报错（code 2003）：Invalid or revoked API key' }) }
   }
   if (key === 'company-chat') {
     if (companyChatError !== null) return { ok: false, status: 500, json: async () => ({ error: companyChatError }) }
@@ -828,6 +849,35 @@ console.log('\n[5d2] 公司数据：AI 查动态 + 自动填表 + 外部数据�
   const companyText = collectText(tree)
   check('公司数据页有 AI 查询入口', companyText.includes('和 AI 一起查公司动态') && byData('company-input') !== undefined)
   check('页面说明了会自动填表', companyText.includes('自动填进下面的表'))
+
+  // 同花顺官方数据：Key 的保存 / 清除 / 测试
+  const thsText = collectText(tree)
+  check('公司数据页有同花顺入口', thsText.includes('同花顺官方数据'))
+  check('说明了插件走 REST 而不是 MCP', thsText.includes('走 REST') || thsText.includes('无法执行宿主注册的 MCP 工具'))
+  check('给了签发 Key 的地址', collect(tree).some((n) => n.type === 'a' && String(n.props.href).includes('fuyao.aicubes.cn/admin')))
+  check('未配置时状态写清楚', byData('ths-status') !== undefined && collectText(byData('ths-status')).includes('未配置'))
+  check('未配置时不能测试连接', collect(tree).find((n) => n.props['data-astk'] === 'ths-test').props.disabled === true)
+
+  setField('ths-key', 'abcd1234efgh5678')
+  collect(tree).find((n) => n.props['data-astk'] === 'ths-save').props.onClick()
+  tree = render()
+  await tick(); await tick()
+  tree = render()
+  check('保存后显示掩码', collectText(byData('ths-status')).includes('abcd****5678'), collectText(byData('ths-status')))
+  check('保存后清空输入框', byData('ths-key').props.value === '')
+  check('保存后给出反馈', collectText(tree).includes('已保存同花顺 API Key'))
+
+  collect(tree).find((n) => n.props['data-astk'] === 'ths-test').props.onClick()
+  tree = render()
+  await tick(); await tick()
+  tree = render()
+  check('测试连接给出结果', collectText(tree).includes('连接正常'), (collectText(tree).match(/✓[^，。]*/) || ['未找到'])[0])
+
+  collect(tree).find((n) => n.props['data-astk'] === 'ths-clear').props.onClick()
+  tree = render()
+  await tick(); await tick()
+  tree = render()
+  check('清除后回到未配置', collectText(byData('ths-status')).includes('未配置'))
 
   // 外部数据源：列出已配置的 HTTP 接口，并如实说明为什么不能直接调 MCP
   check('列出已配置的数据源', companyText.includes('巨潮公告') && companyText.includes('https://api.example.com/ann?code={code}'))

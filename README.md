@@ -2,7 +2,7 @@
 
 A股港股量化工作台 —— DeepSeek Harness 插件。
 
-**当前版本 `0.8.0`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
+**当前版本 `0.9.0`** · [npm](https://www.npmjs.com/package/dsh-astock) · [版本记录](#版本记录) · [提交历史](https://github.com/hzy1522/dsh-astock/commits/main)
 
 在侧边栏底部提供独立的「A股港股」整页：**A 股与港股**的自选股管理、K线图、公司财务数据、策略配置与回测。
 
@@ -430,12 +430,38 @@ AI 生成的策略会被要求同时给出条件函数组合与 `why` 说明，�
 
 ## 数据源
 
-全部免密钥。K线与行情以腾讯为主源、新浪为备源，搜索与财务用东方财富。
+默认**全部免密钥**。K线与行情以腾讯为主源、新浪为备源，搜索与财务用东方财富。
 
 - K线：`web.ifzq.gtimg.cn`（按年区间分页）→ 备源 `money.finance.sina.com.cn`
 - 行情：`qt.gtimg.cn`（**GBK 编码**，按响应头 charset 解码）
 - 搜索：`searchapi.eastmoney.com`；失败时回退为纯代码录入
 - 财务：`datacenter-web.eastmoney.com`
+- 事件：港交所/交易所公告（正文日期）、预约披露时间表、分红实施公告
+- 资讯检索（AI 联网查证的兜底）：`search-api-web.eastmoney.com`
+
+### 同花顺官方数据（可选，需要自己的 API Key）
+
+同花顺官方有一套面向 AI Agent 的 A 股数据服务：**同一个 API Key，提供 MCP 与 REST 两套入口**。
+
+| 项 | 值 |
+| --- | --- |
+| 官网 / 文档 | <https://fuyao.aicubes.cn/> · <https://fuyao.aicubes.cn/docs/> |
+| API Key | <https://fuyao.aicubes.cn/admin/> 免费签发 |
+| REST | `https://fuyao.aicubes.cn/api/...`，请求头 `X-api-key` |
+| 托管 MCP（HTTP） | `https://fuyao.aicubes.cn/mcp/a-share`、`/mcp/a-share-index`、`/mcp/meta` 等 6 个 |
+| 限流 | 不限制累计调用次数（异常并发会 429 / `code=4001`） |
+
+在「公司数据」页填入 Key 之后：
+
+- AI 助手会多出 `ths_corporate_actions`（**除权除息 / 分红送股**）、`ths_prices_snapshot`（行情）、
+  `ths_hot_stocks`（热榜）、`ths_dragon_tiger`（龙虎榜）四个工具；
+- **除权除息事件**在东方财富那份表为空时，自动改用同花顺官方复权事件兜底；
+- Key 只存在本地（`$DSH_ASTOCK_HOME/hithink.json`），接口里只回掩码，不回明文。
+
+> **为什么插件走 REST 而不是直接连 MCP**：宿主里注册的 MCP 工具在**插件作用域内不可执行**
+> （插件拿到的 `tools` 服务只有 `register/schemas/get`，**没有 `execute`**，见下文实测）。
+> 好在这套服务两套入口共用同一个 Key、同一批数据，走 REST 等价且更简单。
+> 当前覆盖 **A 股**，港股不在它的范围内。
 
 ## 配置
 
@@ -467,8 +493,8 @@ tests/
 ```bash
 pnpm test                 # 三套全跑
 node tests/engine.test.mjs   # 策略与回测引擎（纯离线，43 项）
-node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + 事件路由 + 港股事件解析 + 联网查证工具循环 + 多轮对话与表达式输出 + 检索兜底与预查 + 公司数据对话（262 项）
-node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链 + AI 对话与表达式模式 + 公司数据对话与数据源管理（264 项）
+node tests/host.test.mjs     # Host 半边：真实上游 + mock llm + 港股 + 自选股混排 + 免责声明 + 事件路由 + 港股事件解析 + 联网查证工具循环 + 多轮对话与表达式输出 + 检索兜底与预查 + 公司数据对话 + 同花顺数据（280 项）
+node tests/client.test.mjs   # 客户端 bundle：真实执行组件 + 数据流 + 策略模式 + AI 入口 + 港股规则 + 回测区间与档位 + 免责弹窗 + 情绪因子 + 事件因子与自定义事件 + 交易证据链 + AI 对话与表达式模式 + 公司数据对话与数据源管理 + 同花顺 Key（274 项）
 ```
 
 `host.test.mjs` 与 `client.test.mjs` 需要网络（要打腾讯/东财的真实接口）。`engine.test.mjs` 完全离线，只读 `tests/fixtures/`。
@@ -506,6 +532,27 @@ curl -s --max-time 5 http://127.0.0.1:3080/plugins/events \
 
 每个版本对应一次 GitHub 提交与一次 npm 发布。完整提交历史见
 [commits](https://github.com/hzy1522/dsh-astock/commits/main)。
+
+### 0.9.0
+
+**接入同花顺官方数据（REST API，凭一个 Key）**
+
+调研确认：同花顺官方（HiThink-Tech）发布了面向 AI Agent 的金融数据服务
+`HiThink-Tech/Financial-API`，**同一个 API Key 同时提供 MCP 与 REST 两套入口**：
+6 个托管 MCP 端点（`https://fuyao.aicubes.cn/mcp/*`，HTTP 传输）与一组 REST 接口
+（`https://fuyao.aicubes.cn/api/...`，请求头 `X-api-key`），不限制累计调用次数。
+
+由于插件作用域执行不了宿主注册的 MCP 工具（实测），插件改走**同一份数据的 REST 入口**：
+
+- 「公司数据」页新增「同花顺官方数据」：粘贴 Key → 保存 / 清除 / 测试连接；Key 本地落盘、只回掩码。
+- 配好后 AI 助手多出四个工具：`ths_corporate_actions`（除权除息/分红送股）、
+  `ths_prices_snapshot`、`ths_hot_stocks`、`ths_dragon_tiger`。
+- **除权除息事件**在东方财富为空时用同花顺官方复权事件兜底（A 股）。
+- 代码 → `thscode` 的交易所后缀映射（沪/深/北），港股明确报「不在覆盖范围」。
+
+测试：host 262 → 280 项（后缀映射、Key 掩码与清除、未配置不暴露工具、配置后注入工具、
+假 Key 被如实拒绝、除权兜底），client 264 → 274 项（Key 表单、掩码、测试连接、清除）。
+合计 597 项全通过。
 
 ### 0.8.0
 
